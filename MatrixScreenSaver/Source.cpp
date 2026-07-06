@@ -139,16 +139,38 @@ static wchar_t RandomKatakana() {
     return static_cast<wchar_t>(0x30A0 + FastRandBounded(KATAKANA_COUNT));
 }
 
+// Above this canvas area (roughly a single 1080p display), column count grows
+// linearly with area even though a human's perceived "density" only cares
+// about glyphs-per-visible-area. On large single displays, 4K panels, or
+// triple-monitor spans, that means far more live columns/symbols than the
+// effect was ever tuned for. We scale the density down above the threshold
+// so glyphs-per-area stays roughly constant instead of raw column count
+// growing unbounded. Below the threshold this is a no-op (scale == 1.0),
+// so normal single-monitor setups render identically to before.
+static const float DENSITY_BASELINE_AREA = 1920.0f * 1080.0f;
+
+static float ComputeDensityScale(int width, int height) {
+    float area = static_cast<float>(width) * static_cast<float>(height);
+    if (area <= DENSITY_BASELINE_AREA) return 1.0f;
+    float scale = DENSITY_BASELINE_AREA / area;
+    // Floor it so extreme spans (e.g. 3x 4K) still keep a reasonable amount
+    // of visible rain rather than thinning out too aggressively.
+    if (scale < 0.35f) scale = 0.35f;
+    return scale;
+}
+
 static void InitColumns(int width, int height) {
     g_columns.clear();
+    const float densityScale = ComputeDensityScale(width, height);
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         const LayerConfig& cfg = LAYER_CONFIGS[layer];
         int colWidth = cfg.fontSize;
         int maxCols = (width - cfg.columnOffsetPx) / colWidth;
         if (maxCols < 1) maxCols = 1;
 
+        const float effectiveDensity = cfg.columnDensity * densityScale;
         for (int c = 0; c < maxCols; ++c) {
-            if (FastRandFloat01() > cfg.columnDensity) continue;
+            if (FastRandFloat01() > effectiveDensity) continue;
 
             ColumnState col;
             col.x = cfg.columnOffsetPx + c * colWidth;
@@ -193,7 +215,12 @@ static HRESULT CreateDeviceResources(HWND hwnd) {
             D2D1_RENDER_TARGET_TYPE_DEFAULT,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
             0.0f, 0.0f, D2D1_RENDER_TARGET_USAGE_NONE),
-        D2D1::HwndRenderTargetProperties(hwnd, size, D2D1_PRESENT_OPTIONS_IMMEDIATELY),
+        // D2D1_PRESENT_OPTIONS_NONE lets DWM pace presentation to vsync instead
+        // of flipping as fast as possible. On high-refresh displays this cuts
+        // GPU/composite work substantially; the 16ms timer already caps our
+        // intended frame rate near 60fps, so there's no visible change to the
+        // rain's motion, only less wasted presentation work between frames.
+        D2D1::HwndRenderTargetProperties(hwnd, size, D2D1_PRESENT_OPTIONS_NONE),
         &g_renderTarget);
     if (FAILED(hr)) return hr;
 
@@ -318,7 +345,7 @@ static void DrawFrame(DWORD tickCount) {
                     s.nextChangeTick = tickCount + static_cast<DWORD>(s.interval);
                 }
 
-                s.y += static_cast<float>(s.speed) * cfg.speedMul * 1.4f;
+                s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f;
                 if (s.y > g_height) s.y = -static_cast<float>(cfg.fontSize);
 
                 // Skip the draw call entirely for glyphs currently outside
