@@ -1,13 +1,6 @@
 // MatrixScreensaver.cpp
-// A highly advanced, GPU-accelerated Windows screensaver (.scr) implementing a
-// falling-katakana "Matrix rain" canvas layered with an integrated real-time 
-// hardware monitoring telemetry matrix and device-level history sparklines.
-//
-// Features:
-// - Explicit Dedicated GPU enumeration preference over Integrated Devices via DXGI.
-// - Localized metrics separation (Program Footprint vs Total Device Metrics).
-// - Power, Voltage, and Core thermal monitoring arrays.
-// - Hardware status sparklines reflecting system-wide performance conditions.
+// A GPU-accelerated Windows screensaver (.scr) implementing a falling-katakana
+// "Matrix rain" effect using Direct2D, with multiple parallax depth layers.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -17,21 +10,13 @@
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
-#include <sstream>
-#include <iomanip>
 #include <windows.h>
-#include <psapi.h>
 #include <d2d1.h>
-#include <dxgi1_4.h> // Enhanced DXGI interfaces for memory queries
 #include <dwrite.h>
-#include <pdh.h>
-#include <pdhmsg.h>   
-#include <wrl/client.h> 
+#include <wrl/client.h>
 
 #pragma comment(lib, "d2d1.lib")
-#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dwrite.lib")
-#pragma comment(lib, "Pdh.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Gdi32.lib")
 
@@ -94,13 +79,7 @@ static std::vector<std::vector<size_t>> g_columnsByLayer;
 static ComPtr<ID2D1Factory>          g_d2dFactory;
 static ComPtr<ID2D1HwndRenderTarget> g_renderTarget;
 static ComPtr<IDWriteFactory>        g_dwriteFactory;
-static ComPtr<IDWriteTextFormat>     g_overlayTextFormat;
 static ComPtr<ID2D1SolidColorBrush>  g_fadeBrush;
-static ComPtr<ID2D1SolidColorBrush>  g_overlayBrush;
-static ComPtr<ID2D1SolidColorBrush>  g_sparklineStrokeBrush;
-static ComPtr<ID2D1SolidColorBrush>  g_sparklineFillBrush;
-static ComPtr<ID2D1SolidColorBrush>  g_overlayBgBrush;
-static ComPtr<ID2D1SolidColorBrush>  g_overlayBorderBrush;
 static ComPtr<ID2D1BitmapRenderTarget> g_trailTarget;
 
 struct GlyphAtlas {
@@ -113,82 +92,12 @@ struct GlyphAtlas {
 static GlyphAtlas g_atlases[NUM_LAYERS];
 
 static bool g_isPreview = false;
-static bool g_benchmarkMode = false;
 static ULONGLONG g_startTick = 0;
 static const ULONGLONG STARTUP_GRACE_MS = 1000;
 static bool InGracePeriod() { return (GetTickCount64() - g_startTick) < STARTUP_GRACE_MS; }
 
 static POINT g_lastMousePos{};
 static bool  g_mouseInit = false;
-
-// ---------------------------------------------------------------------------
-// Telemetry Tracking & Ring Buffers
-// ---------------------------------------------------------------------------
-static const int SPARKLINE_HISTORY_SIZE = 60;
-
-struct PerformanceHistory {
-    float data[SPARKLINE_HISTORY_SIZE] = { 0.0f };
-    int head = 0;
-
-    void Push(float val) {
-        data[head] = val;
-        head = (head + 1) % SPARKLINE_HISTORY_SIZE;
-    }
-    float GetAt(int idx) const {
-        return data[(head + idx) % SPARKLINE_HISTORY_SIZE];
-    }
-};
-
-struct HardwareDiagnostics {
-    // String descriptions & Architectural classifications
-    std::wstring gpuDeviceName = L"Processing Execution Target...";
-    std::wstring gpuArchitectureType = L"Discrete / Dedicated High Performance";
-    std::wstring gpuDriverCode = L"N/A";
-
-    // Program Isolation Metrics
-    double programCpuPercent = 0.0;
-    double programRamUsedMB = 0.0;
-    double programVramUsedMB = 0.0;
-
-    // Total System Metrics
-    double systemFps = 0.0;
-    double systemCpuPercent = 0.0;
-    double systemGpuPercent = 0.0;
-    int    systemRamPercent = 0;
-    double systemRamUsedGB = 0.0;
-    double systemRamTotalGB = 0.0;
-
-    // Environmental Tracking Matrices
-    float  cpuCoreVoltage = 1.21f;
-    float  gpuCoreVoltage = 0.98f;
-    float  cpuTemperature = 48.0f;
-    float  gpuTemperature = 54.0f;
-
-    // Battery Status Substructures
-    bool   hasBattery = false;
-    bool   batteryCharging = false;
-    int    batteryPercent = 100;
-    DWORD  batterySecondsLeft = 0;
-
-    // Device-wide Trace Graphs
-    PerformanceHistory totalFpsHistory;
-    PerformanceHistory totalCpuHistory;
-    PerformanceHistory totalGpuHistory;
-    PerformanceHistory totalRamHistory;
-};
-static HardwareDiagnostics g_hw;
-
-static ULONGLONG g_fpsWindowStart = 0;
-static int       g_fpsFrameCount = 0;
-static ULONGLONG g_lastCpuCheckTick = 0;
-static ULONGLONG g_lastKernel100ns = 0, g_lastUser100ns = 0;
-static ULONGLONG g_lastSysKernel100ns = 0, g_lastSysUser100ns = 0, g_lastSysIdle100ns = 0;
-static int       g_numCores = 1;
-
-static PDH_HQUERY   g_pdhQuery = nullptr;
-static PDH_HCOUNTER g_pdhGpuCounter = nullptr;
-static bool         g_pdhAvailable = false;
-static ComPtr<IDXGIAdapter3> g_selectedAdapter; // Active Selected Render Loop Device
 
 // ---------------------------------------------------------------------------
 // Matrix Cascade Random String Generation Engine
@@ -226,274 +135,6 @@ static float FastRandFloat01() {
 
 static wchar_t RandomKatakana() {
     return static_cast<wchar_t>(0x30A0 + FastRandBounded(KATAKANA_COUNT));
-}
-
-// ---------------------------------------------------------------------------
-// Hardware Interrogation & Processing Selection Engines
-// ---------------------------------------------------------------------------
-static void SelectPreferredGraphicsDevice() {
-    ComPtr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
-        g_hw.gpuDeviceName = L"Default Graphics Context";
-        return;
-    }
-
-    ComPtr<IDXGIAdapter1> adapter1;
-    ComPtr<IDXGIAdapter1> bestAdapter;
-    SIZE_T maxVram = 0;
-    bool foundDiscrete = false;
-
-    // Loop through every physical adapter found on the system
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter1) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC1 desc;
-        if (SUCCEEDED(adapter1->GetDesc1(&desc))) {
-            // Filter out software emulators
-            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-
-            // Preference Logic: Select via highest Local Dedicated Video Memory
-            // Integrated chips generally present small numbers (e.g. 128MB or 0MB shared)
-            bool isDiscrete = (desc.DedicatedVideoMemory > 512 * 1024 * 1024);
-
-            if (isDiscrete && !foundDiscrete) {
-                // First dedicated device discovered takes overriding priority
-                bestAdapter = adapter1;
-                maxVram = desc.DedicatedVideoMemory;
-                foundDiscrete = true;
-            }
-            else if (isDiscrete && foundDiscrete) {
-                if (desc.DedicatedVideoMemory > maxVram) {
-                    bestAdapter = adapter1;
-                    maxVram = desc.DedicatedVideoMemory;
-                }
-            }
-            else if (!foundDiscrete) {
-                // If no dedicated adapter has been caught yet, accumulate best fallback integrated processor
-                if (desc.DedicatedVideoMemory > maxVram || !bestAdapter) {
-                    bestAdapter = adapter1;
-                    maxVram = desc.DedicatedVideoMemory;
-                }
-            }
-        }
-    }
-
-    if (bestAdapter) {
-        bestAdapter.As(&g_selectedAdapter);
-        DXGI_ADAPTER_DESC1 finalDesc;
-        if (SUCCEEDED(g_selectedAdapter->GetDesc1(&finalDesc))) {
-            g_hw.gpuDeviceName = std::wstring(finalDesc.Description);
-            wchar_t hexCode[64];
-            swprintf_s(hexCode, L"ID: 0x%04X, Rev: 0x%02X", finalDesc.DeviceId, finalDesc.Revision);
-            g_hw.gpuDriverCode = hexCode;
-
-            if (finalDesc.DedicatedVideoMemory > 512 * 1024 * 1024) {
-                g_hw.gpuArchitectureType = L"Discrete / Dedicated Accelerator (Preferred)";
-            }
-            else {
-                g_hw.gpuArchitectureType = L"Unified / Integrated System iGPU";
-            }
-        }
-    }
-    else {
-        g_hw.gpuDeviceName = L"Standard Graphics Adapter Context";
-        g_hw.gpuArchitectureType = L"Hardware Acceleration Profile Layer";
-    }
-}
-
-static void QueryPowerMetrics() {
-    SYSTEM_POWER_STATUS sps;
-    if (GetSystemPowerStatus(&sps)) {
-        // Flag state 128 indicates no system battery profile available
-        if (sps.BatteryFlag == 128 || sps.BatteryLifePercent == 255) {
-            g_hw.hasBattery = false;
-        }
-        else {
-            g_hw.hasBattery = true;
-            g_hw.batteryPercent = sps.BatteryLifePercent;
-            g_hw.batteryCharging = (sps.ACLineStatus == 1);
-            g_hw.batterySecondsLeft = sps.BatteryLifeTime;
-        }
-    }
-}
-
-static void QueryThermalMetrics() {
-    // NOTE: There is no ring-0/WMI/vendor-SDK sensor read here. Real core
-    // temperatures and voltages require a kernel driver or vendor API
-    // (e.g. LibreHardwareMonitor, HWiNFO SDK) that this screensaver does not
-    // link against. These values are a plausible-looking simulation derived
-    // from load, NOT real sensor telemetry - the overlay label says
-    // "(simulated)" so it isn't mistaken for genuine hardware data.
-    float baseCpu = 44.0f + (static_cast<float>(FastRandBounded(60)) / 10.0f);
-    float baseGpu = 51.0f + (static_cast<float>(FastRandBounded(40)) / 10.0f);
-
-    if (g_hw.systemCpuPercent > 60.0) baseCpu += 12.0f;
-    if (g_hw.systemGpuPercent > 60.0) baseGpu += 9.0f;
-
-    g_hw.cpuTemperature = baseCpu;
-    g_hw.gpuTemperature = baseGpu;
-    g_hw.cpuCoreVoltage = 1.15f + (static_cast<float>(g_hw.systemCpuPercent) * 0.002f);
-    g_hw.gpuCoreVoltage = 0.92f + (static_cast<float>(g_hw.systemGpuPercent) * 0.0015f);
-}
-
-static void InitBenchmarking() {
-    if (!g_benchmarkMode) return;
-
-    SelectPreferredGraphicsDevice();
-
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    g_numCores = static_cast<int>(si.dwNumberOfProcessors);
-    if (g_numCores < 1) g_numCores = 1;
-
-    // Read initial process context tick metrics
-    FILETIME ftCreate, ftExit, ftKernel, ftUser;
-    if (GetProcessTimes(GetCurrentProcess(), &ftCreate, &ftExit, &ftKernel, &ftUser)) {
-        ULARGE_INTEGER k, u;
-        k.LowPart = ftKernel.dwLowDateTime;  k.HighPart = ftKernel.dwHighDateTime;
-        u.LowPart = ftUser.dwLowDateTime;    u.HighPart = ftUser.dwHighDateTime;
-        g_lastKernel100ns = k.QuadPart;
-        g_lastUser100ns = u.QuadPart;
-    }
-
-    // Read initial device-wide systemic metric tick matrices
-    FILETIME sysIdle, sysKernel, sysUser;
-    if (GetSystemTimes(&sysIdle, &sysKernel, &sysUser)) {
-        ULARGE_INTEGER i, k, u;
-        i.LowPart = sysIdle.dwLowDateTime;   i.HighPart = sysIdle.dwHighDateTime;
-        k.LowPart = sysKernel.dwLowDateTime; k.HighPart = sysKernel.dwHighDateTime;
-        u.LowPart = sysUser.dwLowDateTime;   u.HighPart = sysUser.dwHighDateTime;
-        g_lastSysIdle100ns = i.QuadPart;
-        g_lastSysKernel100ns = k.QuadPart;
-        g_lastSysUser100ns = u.QuadPart;
-    }
-
-    g_lastCpuCheckTick = GetTickCount64();
-
-    // Hook systemic GPU core metrics query engine
-    if (PdhOpenQueryW(nullptr, 0, &g_pdhQuery) == ERROR_SUCCESS) {
-        // Monitors broad graphics hardware utilization via WDDM system engine queues
-        if (PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &g_pdhGpuCounter) == ERROR_SUCCESS) {
-            PdhCollectQueryData(g_pdhQuery);
-            g_pdhAvailable = true;
-        }
-    }
-
-    g_fpsWindowStart = GetTickCount64();
-    g_fpsFrameCount = 0;
-}
-
-static void ShutdownBenchmarking() {
-    if (g_pdhQuery) {
-        PdhCloseQuery(g_pdhQuery);
-        g_pdhQuery = nullptr;
-    }
-}
-
-static void UpdateHardwareDiagnostics() {
-    if (!g_benchmarkMode) return;
-
-    ++g_fpsFrameCount;
-    ULONGLONG now = GetTickCount64();
-    ULONGLONG elapsed = now - g_fpsWindowStart;
-
-    if (elapsed >= 1000) {
-        g_hw.systemFps = g_fpsFrameCount * 1000.0 / static_cast<double>(elapsed);
-        g_fpsFrameCount = 0;
-        g_fpsWindowStart = now;
-
-        g_hw.totalFpsHistory.Push(static_cast<float>(g_hw.systemFps));
-
-        // --- Process (Internal Screen Saver Program) Profiles ---
-        FILETIME ftCreate, ftExit, ftKernel, ftUser;
-        if (GetProcessTimes(GetCurrentProcess(), &ftCreate, &ftExit, &ftKernel, &ftUser)) {
-            ULARGE_INTEGER k, u;
-            k.LowPart = ftKernel.dwLowDateTime;  k.HighPart = ftKernel.dwHighDateTime;
-            u.LowPart = ftUser.dwLowDateTime;    u.HighPart = ftUser.dwHighDateTime;
-
-            ULONGLONG kernelDelta = k.QuadPart - g_lastKernel100ns;
-            ULONGLONG userDelta = u.QuadPart - g_lastUser100ns;
-            ULONGLONG totalProcTime = kernelDelta + userDelta;
-            ULONGLONG wallDelta = (now - g_lastCpuCheckTick) * 10000ULL;
-
-            if (wallDelta > 0) {
-                g_hw.programCpuPercent = (100.0 * static_cast<double>(totalProcTime)) / (static_cast<double>(wallDelta) * g_numCores);
-            }
-            g_lastKernel100ns = k.QuadPart;
-            g_lastUser100ns = u.QuadPart;
-        }
-
-        PROCESS_MEMORY_COUNTERS_EX pmc;
-        if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
-            g_hw.programRamUsedMB = static_cast<double>(pmc.PrivateUsage) / (1024.0 * 1024.0);
-        }
-
-        if (g_selectedAdapter) {
-            DXGI_QUERY_VIDEO_MEMORY_INFO vramInfo;
-            // Target segment group index 0 (Local VRAM)
-            if (SUCCEEDED(g_selectedAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vramInfo))) {
-                g_hw.programVramUsedMB = static_cast<double>(vramInfo.CurrentUsage) / (1024.0 * 1024.0);
-            }
-        }
-
-        // --- Global Device-wide Telemetry Profiles ---
-        FILETIME sysIdle, sysKernel, sysUser;
-        if (GetSystemTimes(&sysIdle, &sysKernel, &sysUser)) {
-            ULARGE_INTEGER i, k, u;
-            i.LowPart = sysIdle.dwLowDateTime;   i.HighPart = sysIdle.dwHighDateTime;
-            k.LowPart = sysKernel.dwLowDateTime; k.HighPart = sysKernel.dwHighDateTime;
-            u.LowPart = sysUser.dwLowDateTime;   u.HighPart = sysUser.dwHighDateTime;
-
-            ULONGLONG idleD = i.QuadPart - g_lastSysIdle100ns;
-            ULONGLONG kernD = k.QuadPart - g_lastSysKernel100ns;
-            ULONGLONG userD = u.QuadPart - g_lastSysUser100ns;
-            ULONGLONG sysTotal = kernD + userD;
-
-            if (sysTotal > 0) {
-                g_hw.systemCpuPercent = (100.0 * static_cast<double>(sysTotal - idleD)) / static_cast<double>(sysTotal);
-            }
-            g_lastSysIdle100ns = i.QuadPart;
-            g_lastSysKernel100ns = k.QuadPart;
-            g_lastSysUser100ns = u.QuadPart;
-        }
-        g_hw.totalCpuHistory.Push(static_cast<float>(g_hw.systemCpuPercent));
-
-        MEMORYSTATUSEX memInfo;
-        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-        if (GlobalMemoryStatusEx(&memInfo)) {
-            g_hw.systemRamTotalGB = static_cast<double>(memInfo.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0);
-            g_hw.systemRamUsedGB = static_cast<double>(memInfo.ullTotalPhys - memInfo.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
-            g_hw.systemRamPercent = static_cast<int>(memInfo.dwMemoryLoad);
-        }
-        g_hw.totalRamHistory.Push(static_cast<float>(g_hw.systemRamPercent));
-
-        if (g_pdhAvailable) {
-            PdhCollectQueryData(g_pdhQuery);
-            DWORD size = 0, count = 0;
-            PdhGetFormattedCounterArrayW(g_pdhGpuCounter, PDH_FMT_DOUBLE, &size, &count, nullptr);
-            if (size > 0) {
-                std::vector<char> buf(size);
-                auto items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
-                if (PdhGetFormattedCounterArrayW(g_pdhGpuCounter, PDH_FMT_DOUBLE, &size, &count, items) == ERROR_SUCCESS) {
-                    double highestUsage = 0.0;
-                    for (DWORD idx = 0; idx < count; ++idx) {
-                        if ((items[idx].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA ||
-                            items[idx].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA) &&
-                            items[idx].FmtValue.doubleValue > highestUsage) {
-                            highestUsage = items[idx].FmtValue.doubleValue;
-                        }
-                    }
-                    g_hw.systemGpuPercent = highestUsage;
-                }
-            }
-        }
-        // Normalize out background rendering tracking drops
-        if (g_hw.systemGpuPercent > 100.0) g_hw.systemGpuPercent = 100.0;
-        g_hw.totalGpuHistory.Push(static_cast<float>(g_hw.systemGpuPercent));
-
-        g_lastCpuCheckTick = now;
-
-        QueryPowerMetrics();
-        QueryThermalMetrics();
-    }
 }
 
 static void InitColumns(int width, int height) {
@@ -556,23 +197,6 @@ static HRESULT CreateDeviceResources(HWND hwnd) {
     hr = g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.16f), &g_fadeBrush);
     if (FAILED(hr)) return hr;
 
-    hr = g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 1.0f, 0.25f, 1.0f), &g_overlayBrush);
-    if (FAILED(hr)) return hr;
-
-    hr = g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.95f, 0.4f, 0.9f), &g_sparklineStrokeBrush);
-    if (FAILED(hr)) return hr;
-
-    hr = g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.35f, 0.08f, 0.22f), &g_sparklineFillBrush);
-    if (FAILED(hr)) return hr;
-
-    // Cached once instead of being recreated every frame inside
-    // DrawBenchmarkOverlay (previously 2 CreateSolidColorBrush calls x ~60/sec).
-    hr = g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.01f, 0.04f, 0.01f, 0.85f), &g_overlayBgBrush);
-    if (FAILED(hr)) return hr;
-
-    hr = g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.7f, 0.2f, 0.5f), &g_overlayBorderBrush);
-    if (FAILED(hr)) return hr;
-
     hr = g_renderTarget->CreateCompatibleRenderTarget(&g_trailTarget);
     if (FAILED(hr)) return hr;
 
@@ -580,19 +204,6 @@ static HRESULT CreateDeviceResources(HWND hwnd) {
     g_trailTarget->Clear(D2D1::ColorF(D2D1::ColorF::Black));
     g_trailTarget->EndDraw();
 
-    return S_OK;
-}
-
-static HRESULT CreateOverlayTextFormat() {
-    HRESULT hr = g_dwriteFactory->CreateTextFormat(
-        L"Consolas", nullptr,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-        13.0f, L"", &g_overlayTextFormat);
-    if (FAILED(hr)) return hr;
-
-    g_overlayTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    g_overlayTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-    g_overlayTextFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     return S_OK;
 }
 
@@ -655,11 +266,6 @@ static void DiscardDeviceResources() {
         g_atlases[layer].trailBitmap.Reset();
     }
     g_trailTarget.Reset();
-    g_overlayBorderBrush.Reset();
-    g_overlayBgBrush.Reset();
-    g_sparklineStrokeBrush.Reset();
-    g_sparklineFillBrush.Reset();
-    g_overlayBrush.Reset();
     g_fadeBrush.Reset();
     g_renderTarget.Reset();
 }
@@ -675,9 +281,6 @@ static HRESULT InitDirect2D(HWND hwnd) {
     hr = CreateDeviceResources(hwnd);
     if (FAILED(hr)) return hr;
 
-    hr = CreateOverlayTextFormat();
-    if (FAILED(hr)) return hr;
-
     for (int i = 0; i < NUM_LAYERS; ++i) {
         hr = BuildAtlasForLayer(i);
         if (FAILED(hr)) return hr;
@@ -686,121 +289,8 @@ static HRESULT InitDirect2D(HWND hwnd) {
 }
 
 // ---------------------------------------------------------------------------
-// Hardware Visualization Overlay Engine
+// Frame Rendering
 // ---------------------------------------------------------------------------
-static void DrawDeviceSparkline(ID2D1RenderTarget* rt, const PerformanceHistory& history, D2D1_RECT_F bounds, float maxVal) {
-    ComPtr<ID2D1PathGeometry> pathGeom;
-    if (FAILED(g_d2dFactory->CreatePathGeometry(&pathGeom))) return;
-
-    ComPtr<ID2D1GeometrySink> sink;
-    if (FAILED(pathGeom->Open(&sink))) return;
-
-    float stepX = (bounds.right - bounds.left) / static_cast<float>(SPARKLINE_HISTORY_SIZE - 1);
-    float h = bounds.bottom - bounds.top;
-
-    auto CalculateMapNode = [&](int i) -> D2D1_POINT_2F {
-        float v = history.GetAt(i);
-        if (v > maxVal) v = maxVal;
-        if (v < 0.0f)   v = 0.0f;
-        return D2D1::Point2F(bounds.left + (i * stepX), bounds.top + ((1.0f - (v / maxVal)) * h));
-    };
-
-    // Compute every mapped point exactly once and reuse it for both the
-    // filled area and the stroked line, instead of calling
-    // CalculateMapNode() twice per sample.
-    D2D1_POINT_2F points[SPARKLINE_HISTORY_SIZE];
-    for (int i = 0; i < SPARKLINE_HISTORY_SIZE; ++i) {
-        points[i] = CalculateMapNode(i);
-    }
-
-    sink->BeginFigure(D2D1::Point2F(bounds.left, bounds.bottom), D2D1_FIGURE_BEGIN_FILLED);
-    for (int i = 0; i < SPARKLINE_HISTORY_SIZE; ++i) {
-        sink->AddLine(points[i]);
-    }
-    sink->AddLine(D2D1::Point2F(bounds.right, bounds.bottom));
-    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-    sink->Close();
-
-    rt->FillGeometry(pathGeom.Get(), g_sparklineFillBrush.Get());
-
-    ComPtr<ID2D1PathGeometry> lineGeom;
-    if (SUCCEEDED(g_d2dFactory->CreatePathGeometry(&lineGeom))) {
-        ComPtr<ID2D1GeometrySink> lineSink;
-        if (SUCCEEDED(lineGeom->Open(&lineSink))) {
-            lineSink->BeginFigure(points[0], D2D1_FIGURE_BEGIN_HOLLOW);
-            for (int i = 1; i < SPARKLINE_HISTORY_SIZE; ++i) {
-                lineSink->AddLine(points[i]);
-            }
-            lineSink->EndFigure(D2D1_FIGURE_END_OPEN);
-            lineSink->Close();
-            rt->DrawGeometry(lineGeom.Get(), g_sparklineStrokeBrush.Get(), 1.5f);
-        }
-    }
-}
-
-static void DrawBenchmarkOverlay(ID2D1RenderTarget* rt) {
-    if (!g_benchmarkMode) return;
-
-    std::wstringstream ss;
-    ss << L"================== SOFTWARE TELEMETRY PROCESS MATRIX ==================\n";
-    ss << L"PROGRAM CPU LOAD:   " << std::fixed << std::setprecision(2) << g_hw.programCpuPercent << L" %\n";
-    ss << L"PROGRAM RAM CORES:  " << std::fixed << std::setprecision(1) << g_hw.programRamUsedMB << L" MB Working Set\n";
-    ss << L"PROGRAM LOCAL VRAM: " << std::fixed << std::setprecision(1) << g_hw.programVramUsedMB << L" MB Allocated Segment\n\n";
-
-    ss << L"================== DEVICE HARDWARE MONITOR PIPELINES ==================\n";
-    ss << L"HARDWARE ADAPTER:   " << g_hw.gpuDeviceName << L"\n";
-    ss << L"CLASSIFICATION:     " << g_hw.gpuArchitectureType << L"\n";
-    ss << L"DEVICE HARDWARE ID: " << g_hw.gpuDriverCode << L"\n\n";
-
-    ss << L"TOTAL DEVICE FPS:   " << std::fixed << std::setprecision(1) << g_hw.systemFps << L" Frame Cadence\n\n";
-    ss << L"TOTAL DEVICE CPU:   " << std::fixed << std::setprecision(1) << g_hw.systemCpuPercent << L" %  [Core Vtg (sim): " << g_hw.cpuCoreVoltage << L" V]\n\n";
-    ss << L"TOTAL DEVICE GPU:   " << std::fixed << std::setprecision(1) << g_hw.systemGpuPercent << L" %  [Core Vtg (sim): " << g_hw.gpuCoreVoltage << L" V]\n\n";
-    ss << L"TOTAL DEVICE RAM:   " << g_hw.systemRamPercent << L" %  [" << g_hw.systemRamUsedGB << L" GB Used / " << g_hw.systemRamTotalGB << L" GB Total]\n\n";
-
-    ss << L"CORE TEMP (SIMULATED): CPU Core Thermal: " << std::fixed << std::setprecision(1) << g_hw.cpuTemperature << L" \u00B0C | GPU Hotspot: " << g_hw.gpuTemperature << L" \u00B0C\n";
-
-    if (g_hw.hasBattery) {
-        ss << L"POWER CAPACITOR:    System Battery: " << g_hw.batteryPercent << L" % "
-            << (g_hw.batteryCharging ? L"[Charging Operations]" : L"[Discharging Mode]");
-    }
-    else {
-        ss << L"POWER CAPACITOR:    AC Wall Circuit Connected (No Battery Mod)";
-    }
-
-    std::wstring outStr = ss.str();
-
-    // Sizing allocations for full telemetry monitoring dashboard panel interface layout
-    D2D1_RECT_F layoutRect = D2D1::RectF(20.0f, 20.0f, 760.0f, 410.0f);
-
-    rt->FillRectangle(layoutRect, g_overlayBgBrush.Get());
-    rt->DrawRectangle(layoutRect, g_overlayBorderBrush.Get(), 1.0f);
-
-    rt->DrawTextW(outStr.c_str(), static_cast<UINT32>(outStr.length()), g_overlayTextFormat.Get(),
-        D2D1::RectF(layoutRect.left + 15, layoutRect.top + 15, layoutRect.right - 15, layoutRect.bottom - 15),
-        g_overlayBrush.Get());
-
-    // --- System Level Graph Node Alignments ---
-    float graphX = layoutRect.right - 210.0f;
-    float graphW = 195.0f;
-    float graphH = 26.0f;
-
-    // Line 11: Total Device FPS Alignment mapping
-    D2D1_RECT_F graphFpsRect = D2D1::RectF(graphX, layoutRect.top + 158.0f, graphX + graphW, layoutRect.top + 158.0f + graphH);
-    DrawDeviceSparkline(rt, g_hw.totalFpsHistory, graphFpsRect, 120.0f);
-
-    // Line 13: Total Device CPU Alignment mapping
-    D2D1_RECT_F graphCpuRect = D2D1::RectF(graphX, layoutRect.top + 196.0f, graphX + graphW, layoutRect.top + 196.0f + graphH);
-    DrawDeviceSparkline(rt, g_hw.totalCpuHistory, graphCpuRect, 100.0f);
-
-    // Line 15: Total Device GPU Alignment mapping
-    D2D1_RECT_F graphGpuRect = D2D1::RectF(graphX, layoutRect.top + 234.0f, graphX + graphW, layoutRect.top + 234.0f + graphH);
-    DrawDeviceSparkline(rt, g_hw.totalGpuHistory, graphGpuRect, 100.0f);
-
-    // Line 17: Total Device RAM Alignment mapping
-    D2D1_RECT_F graphRamRect = D2D1::RectF(graphX, layoutRect.top + 272.0f, graphX + graphW, layoutRect.top + 272.0f + graphH);
-    DrawDeviceSparkline(rt, g_hw.totalRamHistory, graphRamRect, 100.0f);
-}
-
 static void DrawFrame(DWORD tickCount) {
     if (!g_renderTarget || !g_trailTarget) return;
 
@@ -820,7 +310,8 @@ static void DrawFrame(DWORD tickCount) {
                     s.value = RandomKatakana();
                 }
 
-                s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f;
+                // SPEED CHANGE!
+                s.y += static_cast<float>(s.speed) * cfg.speedMul * 1.4f;
                 if (s.y > g_height) s.y = -static_cast<float>(cfg.fontSize);
 
                 int glyphIndex = static_cast<int>(s.value) - 0x30A0;
@@ -841,7 +332,6 @@ static void DrawFrame(DWORD tickCount) {
 
     g_renderTarget->BeginDraw();
     g_renderTarget->DrawBitmap(trailBitmap.Get(), D2D1::RectF(0, 0, static_cast<float>(g_width), static_cast<float>(g_height)));
-    DrawBenchmarkOverlay(g_renderTarget.Get());
     HRESULT hr = g_renderTarget->EndDraw();
 
     if (hr == D2DERR_RECREATE_TARGET) {
@@ -850,8 +340,6 @@ static void DrawFrame(DWORD tickCount) {
             for (int i = 0; i < NUM_LAYERS; ++i) BuildAtlasForLayer(i);
         }
     }
-
-    UpdateHardwareDiagnostics();
 }
 
 static void ResetMouseTracking(HWND hwnd) {
@@ -874,13 +362,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_startTick = GetTickCount64();
 
         if (FAILED(InitDirect2D(hwnd))) {
-            MessageBoxW(hwnd, L"Direct2D Core Telemetry Interface Failure.", L"Matrix Screensaver", MB_OK | MB_ICONERROR);
+            MessageBoxW(hwnd, L"Direct2D initialization failed.", L"Matrix Screensaver", MB_OK | MB_ICONERROR);
             DestroyWindow(hwnd);
             return 0;
         }
 
         InitColumns(g_width, g_height);
-        InitBenchmarking();
 
         if (!g_isPreview) ShowCursor(FALSE);
         ResetMouseTracking(hwnd);
@@ -907,12 +394,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_renderTarget->Resize(size);
 
             // g_trailTarget (the offscreen bitmap render target holding the
-            // fading trail buffer) was previously never rebuilt here, so
-            // after any resize it stayed at the old dimensions while
-            // g_renderTarget grew/shrank - the trail bitmap would then be
-            // stretched onto the new-size render target every frame.
-            // Recreate it at the new size and reseed the columns so the
-            // rain layout matches the new window bounds.
+            // fading trail buffer) must be rebuilt here at the new size and
+            // the columns reseeded so the rain layout matches the new bounds.
             g_trailTarget.Reset();
             if (SUCCEEDED(g_renderTarget->CreateCompatibleRenderTarget(&g_trailTarget))) {
                 g_trailTarget->BeginDraw();
@@ -958,7 +441,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
         if (!g_isPreview) ShowCursor(TRUE);
-        ShutdownBenchmarking();
         DiscardDeviceResources();
         PostQuitMessage(0);
         return 0;
@@ -998,8 +480,8 @@ static HWND CreatePreviewWindow(HINSTANCE hInstance, HWND parent) {
 
 static void ShowConfigDialog(HINSTANCE hInstance, HWND ownerHwnd) {
     MessageBoxW(ownerHwnd,
-        L"Matrix Hardware Diagnostics Telemetry Engine\n\nRun with the executable argument flag '/b' to activate real-time system monitoring overlays alongside the Direct2D rendering pipeline.",
-        L"Settings Profile", MB_OK | MB_ICONINFORMATION);
+        L"Matrix Screensaver\n\nNo configurable options.",
+        L"Settings", MB_OK | MB_ICONINFORMATION);
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,8 +497,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     bool isConfig = false, isPreview = false;
     HWND targetParent = nullptr;
-
-    if (lower.find(L"/b") != std::wstring::npos || lower.find(L"-b") != std::wstring::npos) g_benchmarkMode = true;
 
     if (lower.find(L"/c") != std::wstring::npos || lower.find(L"-c") != std::wstring::npos) {
         isConfig = true;
