@@ -1,6 +1,10 @@
 // MatrixScreensaver.cpp
 // A GPU-accelerated Windows screensaver (.scr) implementing a falling-katakana
-// "Matrix rain" effect using Direct2D, with multiple parallax depth layers.
+// "Matrix rain" effect using Direct3D11 instanced rendering, with multiple
+// parallax depth layers. Direct2D + DirectWrite are used only once at
+// startup/resize to rasterize the glyph atlases (via D3D11/D2D interop);
+// all per-frame drawing is done through D3D11 instancing so each layer's
+// entire visible glyph set is issued as a single draw call.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -12,11 +16,18 @@
 #include <cmath>
 #include <windows.h>
 #include <d2d1.h>
+#include <d2d1_1.h>
 #include <dwrite.h>
+#include <d3d11.h>
+#include <d3dcompiler.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Gdi32.lib")
 
@@ -75,22 +86,76 @@ static std::vector<ColumnState> g_columns;
 static std::vector<std::vector<size_t>> g_columnsByLayer;
 
 // ---------------------------------------------------------------------------
-// Direct2D / Pipeline Graphics Core
+// Direct3D11 Pipeline Core
 // ---------------------------------------------------------------------------
-static ComPtr<ID2D1Factory>          g_d2dFactory;
-static ComPtr<ID2D1HwndRenderTarget> g_renderTarget;
-static ComPtr<IDWriteFactory>        g_dwriteFactory;
-static ComPtr<ID2D1SolidColorBrush>  g_fadeBrush;
-static ComPtr<ID2D1BitmapRenderTarget> g_trailTarget;
+// One instanced draw call renders every visible glyph for a given
+// (layer, head-or-trail) atlas in a single GPU submission, replacing what
+// used to be one DrawBitmap call per visible glyph.
+static ComPtr<ID3D11Device>           g_d3dDevice;
+static ComPtr<ID3D11DeviceContext>    g_d3dContext;
+static ComPtr<IDXGISwapChain>         g_swapChain;
+static ComPtr<ID3D11RenderTargetView> g_backBufferRTV;
+
+// Persistent offscreen trail buffer (equivalent to the old g_trailTarget):
+// never cleared between frames, only faded via a translucent black quad,
+// so the falling-glyph trails accumulate exactly as before.
+static ComPtr<ID3D11Texture2D>          g_trailTexture;
+static ComPtr<ID3D11RenderTargetView>   g_trailRTV;
+static ComPtr<ID3D11ShaderResourceView> g_trailSRV;
+
+static ComPtr<ID3D11VertexShader>  g_vertexShader;
+static ComPtr<ID3D11PixelShader>   g_pixelShader;
+static ComPtr<ID3D11InputLayout>   g_inputLayout;
+static ComPtr<ID3D11Buffer>        g_quadVertexBuffer;   // static unit quad, 4 verts
+static ComPtr<ID3D11Buffer>        g_viewportCB;          // b0: viewport size
+static ComPtr<ID3D11SamplerState>  g_samplerState;
+static ComPtr<ID3D11BlendState>    g_premulAlphaBlend;    // fade + glyph draws into trail buffer
+static ComPtr<ID3D11BlendState>    g_opaqueBlend;         // final composite to backbuffer
+static ComPtr<ID3D11Texture2D>     g_whiteTexture;        // 1x1 opaque white, used for the fade quad
+static ComPtr<ID3D11ShaderResourceView> g_whiteSRV;
+
+// D2D/DWrite are retained solely to rasterize the glyph atlases (one-time,
+// at startup and on resize) via D3D11 interop; they never touch the
+// per-frame render path.
+static ComPtr<ID2D1Factory1>      g_d2dFactory;
+static ComPtr<ID2D1Device>        g_d2dDevice;
+static ComPtr<ID2D1DeviceContext> g_d2dContext;
+static ComPtr<IDWriteFactory>     g_dwriteFactory;
+
+// Per-instance data uploaded to the GPU for one glyph quad. destPos/destSize
+// are in pixels; uv0/uv1 select the glyph's cell within the atlas strip;
+// color is a premultiplied-alpha tint (brightnessMul baked in per layer).
+struct GlyphInstance {
+    float destX, destY;
+    float destW, destH;
+    float u0, v0;
+    float u1, v1;
+    float colorR, colorG, colorB, colorA;
+};
 
 struct GlyphAtlas {
-    ComPtr<ID2D1Bitmap> headBitmap;
-    ComPtr<ID2D1Bitmap> trailBitmap;
+    ComPtr<ID3D11Texture2D>          headTexture, trailTexture;
+    ComPtr<ID3D11ShaderResourceView> headSRV, trailSRV;
     int   cellWidth = 0;
     int   cellHeight = 0;
     int   glyphCount = 0;
 };
 static GlyphAtlas g_atlases[NUM_LAYERS];
+
+// Dynamic instance buffers, one pair per layer (head/trail), resized as
+// needed and refilled every frame. Kept as persistent D3D11 dynamic buffers
+// so we're not allocating/destroying GPU resources every frame.
+struct LayerInstanceBuffer {
+    ComPtr<ID3D11Buffer> buffer;
+    UINT capacity = 0; // in instances
+};
+static LayerInstanceBuffer g_headInstanceBuf[NUM_LAYERS];
+static LayerInstanceBuffer g_trailInstanceBuf[NUM_LAYERS];
+
+// CPU-side scratch, refilled each frame, reused across frames to avoid
+// reallocating the vectors constantly.
+static std::vector<GlyphInstance> g_headScratch[NUM_LAYERS];
+static std::vector<GlyphInstance> g_trailScratch[NUM_LAYERS];
 
 static bool g_isPreview = false;
 static ULONGLONG g_startTick = 0;
@@ -185,7 +250,7 @@ static void InitColumns(int width, int height) {
                 s.y = static_cast<float>(startY - i * cfg.fontSize);
                 s.speed = col.speed;
                 s.value = RandomKatakana();
-                s.interval = 5 + static_cast<int>(FastRandBounded(25));
+                s.interval = 400 + static_cast<int>(FastRandBounded(1400));
                 s.isHead = (i == 0);
                 s.nextChangeTick = static_cast<DWORD>(FastRandBounded(static_cast<uint32_t>(s.interval)));
                 col.symbols.push_back(s);
@@ -203,64 +268,308 @@ static void InitColumns(int width, int height) {
 }
 
 // ---------------------------------------------------------------------------
-// Direct2D Setup Execution Contracts
+// Shader Source (compiled once at startup)
 // ---------------------------------------------------------------------------
-static HRESULT CreateDeviceResources(HWND hwnd) {
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-    D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+// Single shader pair handles all three draw kinds (fade quad, glyph
+// instances, final composite) by varying the bound texture and the
+// per-instance color tint. destPos/destSize are in pixels; the vertex
+// shader converts to NDC using the viewport-size constant buffer.
+static const char* kShaderSource = R"(
+cbuffer ViewportCB : register(b0) {
+    float2 viewport;
+    float2 _padVp;
+};
 
-    HRESULT hr = g_d2dFactory->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(
-            D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-            0.0f, 0.0f, D2D1_RENDER_TARGET_USAGE_NONE),
-        // D2D1_PRESENT_OPTIONS_NONE lets DWM pace presentation to vsync instead
-        // of flipping as fast as possible. On high-refresh displays this cuts
-        // GPU/composite work substantially; the 16ms timer already caps our
-        // intended frame rate near 60fps, so there's no visible change to the
-        // rain's motion, only less wasted presentation work between frames.
-        D2D1::HwndRenderTargetProperties(hwnd, size, D2D1_PRESENT_OPTIONS_NONE),
-        &g_renderTarget);
-    if (FAILED(hr)) return hr;
+struct VSIn {
+    float2 localPos : POSITION;
+    float2 destPos   : IPOS;
+    float2 destSize  : ISIZE;
+    float2 uv0       : IUVA;
+    float2 uv1       : IUVB;
+    float4 color     : ICOLOR;
+};
 
-    hr = g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.16f), &g_fadeBrush);
-    if (FAILED(hr)) return hr;
+struct VSOut {
+    float4 pos   : SV_POSITION;
+    float2 uv    : TEXCOORD0;
+    float4 color : COLOR0;
+};
 
-    hr = g_renderTarget->CreateCompatibleRenderTarget(&g_trailTarget);
-    if (FAILED(hr)) return hr;
+VSOut VSMain(VSIn input) {
+    VSOut o;
+    float2 pixelPos = input.destPos + input.localPos * input.destSize;
+    float2 ndc = float2(
+        (pixelPos.x / viewport.x) * 2.0 - 1.0,
+        1.0 - (pixelPos.y / viewport.y) * 2.0);
+    o.pos = float4(ndc, 0.0, 1.0);
+    o.uv = lerp(input.uv0, input.uv1, input.localPos);
+    o.color = input.color;
+    return o;
+}
 
-    g_trailTarget->BeginDraw();
-    g_trailTarget->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-    g_trailTarget->EndDraw();
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+
+float4 PSMain(VSOut input) : SV_TARGET {
+    float4 texColor = tex.Sample(samp, input.uv);
+    return texColor * input.color;
+}
+)";
+
+static HRESULT CompileShader(const char* entryPoint, const char* target, ComPtr<ID3DBlob>& outBlob) {
+    ComPtr<ID3DBlob> errorBlob;
+    UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#ifdef _DEBUG
+    flags |= D3DCOMPILE_DEBUG;
+#endif
+    HRESULT hr = D3DCompile(kShaderSource, strlen(kShaderSource), nullptr, nullptr, nullptr,
+        entryPoint, target, flags, 0, &outBlob, &errorBlob);
+    if (FAILED(hr) && errorBlob) {
+        OutputDebugStringA(static_cast<const char*>(errorBlob->GetBufferPointer()));
+    }
+    return hr;
+}
+
+// ---------------------------------------------------------------------------
+// Direct3D11 Setup Execution Contracts
+// ---------------------------------------------------------------------------
+static HRESULT CreateD3DDeviceAndSwapChain(HWND hwnd, int width, int height) {
+    DXGI_SWAP_CHAIN_DESC scd = {};
+    // DISCARD (the legacy bit-block-transfer swap effect) is only a valid
+    // combination with a single back buffer - passing BufferCount=2 here
+    // causes CreateSwapChain to return E_INVALIDARG (0x80070057) on
+    // present-day WDDM drivers. FLIP_* effects support BufferCount>1, but
+    // DISCARD does not; since this is a screensaver (not latency/perf
+    // critical) a single back buffer is fine.
+    scd.BufferCount = 1;
+    scd.BufferDesc.Width = width;
+    scd.BufferDesc.Height = height;
+    scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    scd.BufferDesc.RefreshRate.Numerator = 0;
+    scd.BufferDesc.RefreshRate.Denominator = 1;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.OutputWindow = hwnd;
+    scd.SampleDesc.Count = 1;
+    scd.SampleDesc.Quality = 0;
+    scd.Windowed = TRUE;
+    // DISCARD is the broadest-compatible swap effect; this is a screensaver,
+    // not a latency-critical app, so we don't need FLIP_SEQUENTIAL's extra
+    // bookkeeping.
+    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
+    D3D_FEATURE_LEVEL chosen{};
+
+    // BGRA_SUPPORT is required so the same textures can be interop'd into
+    // Direct2D for the one-time atlas rasterization pass.
+    UINT deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    UINT debugFlag = 0;
+#ifdef _DEBUG
+    debugFlag = D3D11_CREATE_DEVICE_DEBUG;
+#endif
+
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags | debugFlag,
+        levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+        &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+
+    // D3D11_CREATE_DEVICE_DEBUG requires the optional "Graphics Tools"
+    // Windows feature (the D3D SDK debug layer). On a machine that doesn't
+    // have it installed, requesting this flag makes the call fail with
+    // E_INVALIDARG (0x80070057) - not a hardware/feature-level problem at
+    // all. Retry once without it before assuming the driver itself is at
+    // fault.
+    if (FAILED(hr) && debugFlag != 0) {
+        hr = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags,
+            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+    }
+
+    // Hardware driver may be missing/unable to satisfy BGRA_SUPPORT at any
+    // of the requested feature levels (common under RDP/some VMs/old GPUs).
+    // Fall back to the WARP software rasterizer rather than failing init
+    // outright - this is a screensaver, so WARP's performance is acceptable.
+    if (FAILED(hr)) {
+        hr = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, deviceFlags,
+            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+    }
+    return hr;
+}
+
+static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
+    ComPtr<ID3DBlob> vsBlob, psBlob;
+    HRESULT hr = CompileShader("VSMain", "vs_4_0", vsBlob);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CompileShader(VSMain)"; return hr; }
+    hr = CompileShader("PSMain", "ps_4_0", psBlob);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CompileShader(PSMain)"; return hr; }
+
+    hr = g_d3dDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_vertexShader);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateVertexShader"; return hr; }
+    hr = g_d3dDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_pixelShader);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreatePixelShader"; return hr; }
+
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,  D3D11_INPUT_PER_VERTEX_DATA,   0 },
+        { "IPOS",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 0,  D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "ISIZE",    0, DXGI_FORMAT_R32G32_FLOAT,       1, 8,  D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "IUVA",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "IUVB",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 24, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "ICOLOR",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+    };
+    hr = g_d3dDevice->CreateInputLayout(layout, ARRAYSIZE(layout), vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateInputLayout"; return hr; }
+
+    // Static unit quad (triangle strip: 0,0 / 1,0 / 0,1 / 1,1), scaled and
+    // positioned per-instance in the vertex shader.
+    const float quadVerts[] = { 0,0, 1,0, 0,1, 1,1 };
+    D3D11_BUFFER_DESC qbd = {};
+    qbd.ByteWidth = sizeof(quadVerts);
+    qbd.Usage = D3D11_USAGE_IMMUTABLE;
+    qbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA qinit = { quadVerts, 0, 0 };
+    hr = g_d3dDevice->CreateBuffer(&qbd, &qinit, &g_quadVertexBuffer);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateBuffer(quadVertexBuffer)"; return hr; }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = sizeof(float) * 4; // float2 viewport + float2 padding, 16-byte aligned
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_d3dDevice->CreateBuffer(&cbd, nullptr, &g_viewportCB);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateBuffer(viewportCB)"; return hr; }
+
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    hr = g_d3dDevice->CreateSamplerState(&sd, &g_samplerState);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateSamplerState"; return hr; }
+
+    // Premultiplied-alpha blend: used for the fade quad and glyph draws into
+    // the persistent trail buffer, since the atlas textures come out of
+    // Direct2D premultiplied.
+    D3D11_BLEND_DESC pbd = {};
+    pbd.RenderTarget[0].BlendEnable = TRUE;
+    pbd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    pbd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    pbd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    pbd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    pbd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    pbd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    pbd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = g_d3dDevice->CreateBlendState(&pbd, &g_premulAlphaBlend);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateBlendState(premulAlpha)"; return hr; }
+
+    // Opaque (blend-disabled) state for the final trail->backbuffer
+    // composite, matching the original's D2D1_ALPHA_MODE_IGNORE behavior:
+    // a straight overwrite regardless of the trail buffer's alpha channel.
+    D3D11_BLEND_DESC obd = {};
+    obd.RenderTarget[0].BlendEnable = FALSE;
+    obd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = g_d3dDevice->CreateBlendState(&obd, &g_opaqueBlend);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateBlendState(opaque)"; return hr; }
+
+    // 1x1 opaque white texture, sampled by the fade quad; tinted by its
+    // instance color (0,0,0,0.16) to produce the translucent black fade.
+    D3D11_TEXTURE2D_DESC wtd = {};
+    wtd.Width = 1; wtd.Height = 1; wtd.MipLevels = 1; wtd.ArraySize = 1;
+    wtd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    wtd.SampleDesc.Count = 1;
+    wtd.Usage = D3D11_USAGE_IMMUTABLE;
+    wtd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    const UINT32 whitePixel = 0xFFFFFFFFu;
+    D3D11_SUBRESOURCE_DATA winit = { &whitePixel, sizeof(UINT32), 0 };
+    hr = g_d3dDevice->CreateTexture2D(&wtd, &winit, &g_whiteTexture);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateTexture2D(whiteTexture)"; return hr; }
+    hr = g_d3dDevice->CreateShaderResourceView(g_whiteTexture.Get(), nullptr, &g_whiteSRV);
+    if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateShaderResourceView(whiteSRV)"; return hr; }
 
     return S_OK;
 }
 
-static HRESULT BuildOneAtlasBitmap(IDWriteTextFormat* format, int cell, D2D1_COLOR_F color, ComPtr<ID2D1Bitmap>& outBitmap) {
-    const int atlasWidth = cell * KATAKANA_COUNT;
-    D2D1_SIZE_F atlasSize = D2D1::SizeF(static_cast<float>(atlasWidth), static_cast<float>(cell));
-
-    ComPtr<ID2D1BitmapRenderTarget> buildTarget;
-    HRESULT hr = g_renderTarget->CreateCompatibleRenderTarget(atlasSize, &buildTarget);
+static HRESULT CreateSizeDependentResources(int width, int height) {
+    ComPtr<ID3D11Texture2D> backBuffer;
+    HRESULT hr = g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (FAILED(hr)) return hr;
+    hr = g_d3dDevice->CreateRenderTargetView(backBuffer.Get(), nullptr, &g_backBufferRTV);
     if (FAILED(hr)) return hr;
 
-    ComPtr<ID2D1SolidColorBrush> brush;
-    buildTarget->CreateSolidColorBrush(color, &brush);
+    // Persistent trail buffer: same size as the client area, never cleared
+    // after this point (only faded), exactly like the old g_trailTarget.
+    D3D11_TEXTURE2D_DESC ttd = {};
+    ttd.Width = width; ttd.Height = height; ttd.MipLevels = 1; ttd.ArraySize = 1;
+    ttd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    ttd.SampleDesc.Count = 1;
+    ttd.Usage = D3D11_USAGE_DEFAULT;
+    ttd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = g_d3dDevice->CreateTexture2D(&ttd, nullptr, &g_trailTexture);
+    if (FAILED(hr)) return hr;
+    hr = g_d3dDevice->CreateRenderTargetView(g_trailTexture.Get(), nullptr, &g_trailRTV);
+    if (FAILED(hr)) return hr;
+    hr = g_d3dDevice->CreateShaderResourceView(g_trailTexture.Get(), nullptr, &g_trailSRV);
+    if (FAILED(hr)) return hr;
 
-    buildTarget->BeginDraw();
-    buildTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
+    const float black[4] = { 0, 0, 0, 1 };
+    g_d3dContext->ClearRenderTargetView(g_trailRTV.Get(), black);
+    return S_OK;
+}
+
+static HRESULT BuildOneAtlasTexture(IDWriteTextFormat* format, int cell, D2D1_COLOR_F color,
+    ComPtr<ID3D11Texture2D>& outTexture, ComPtr<ID3D11ShaderResourceView>& outSRV) {
+    const int atlasWidth = cell * KATAKANA_COUNT;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = atlasWidth;
+    desc.Height = cell;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+    HRESULT hr = g_d3dDevice->CreateTexture2D(&desc, nullptr, &outTexture);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IDXGISurface> surface;
+    hr = outTexture.As(&surface);
+    if (FAILED(hr)) return hr;
+
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    ComPtr<ID2D1Bitmap1> d2dBitmap;
+    hr = g_d2dContext->CreateBitmapFromDxgiSurface(surface.Get(), &bp, &d2dBitmap);
+    if (FAILED(hr)) return hr;
+
+    g_d2dContext->SetTarget(d2dBitmap.Get());
+
+    ComPtr<ID2D1SolidColorBrush> brush;
+    g_d2dContext->CreateSolidColorBrush(color, &brush);
+
+    g_d2dContext->BeginDraw();
+    g_d2dContext->Clear(D2D1::ColorF(0, 0, 0, 0));
     for (int i = 0; i < KATAKANA_COUNT; ++i) {
         wchar_t ch = static_cast<wchar_t>(0x30A0 + i);
         D2D1_RECT_F rect = D2D1::RectF(
             static_cast<float>(i * cell), 0.0f,
             static_cast<float>(i * cell + cell), static_cast<float>(cell));
-        buildTarget->DrawTextW(&ch, 1, format, rect, brush.Get());
+        g_d2dContext->DrawTextW(&ch, 1, format, rect, brush.Get());
     }
-    hr = buildTarget->EndDraw();
+    hr = g_d2dContext->EndDraw();
+    g_d2dContext->SetTarget(nullptr);
     if (FAILED(hr)) return hr;
 
-    return buildTarget->GetBitmap(&outBitmap);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = desc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    return g_d3dDevice->CreateShaderResourceView(outTexture.Get(), &srvDesc, &outSRV);
 }
 
 static HRESULT BuildAtlasForLayer(int layer) {
@@ -274,14 +583,14 @@ static HRESULT BuildAtlasForLayer(int layer) {
         static_cast<float>(cfg.fontSize), L"", &format);
     if (FAILED(hr)) return hr;
 
-    hr = BuildOneAtlasBitmap(format.Get(), cell,
+    hr = BuildOneAtlasTexture(format.Get(), cell,
         D2D1::ColorF(cfg.headR / 255.0f, cfg.headG / 255.0f, cfg.headB / 255.0f, 1.0f),
-        g_atlases[layer].headBitmap);
+        g_atlases[layer].headTexture, g_atlases[layer].headSRV);
     if (FAILED(hr)) return hr;
 
-    hr = BuildOneAtlasBitmap(format.Get(), cell,
+    hr = BuildOneAtlasTexture(format.Get(), cell,
         D2D1::ColorF(cfg.trailR / 255.0f, cfg.trailG / 255.0f, cfg.trailB / 255.0f, 1.0f),
-        g_atlases[layer].trailBitmap);
+        g_atlases[layer].trailTexture, g_atlases[layer].trailSRV);
     if (FAILED(hr)) return hr;
 
     g_atlases[layer].cellWidth = cell;
@@ -292,45 +601,144 @@ static HRESULT BuildAtlasForLayer(int layer) {
 
 static void DiscardDeviceResources() {
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
-        g_atlases[layer].headBitmap.Reset();
-        g_atlases[layer].trailBitmap.Reset();
+        g_atlases[layer].headTexture.Reset();
+        g_atlases[layer].trailTexture.Reset();
+        g_atlases[layer].headSRV.Reset();
+        g_atlases[layer].trailSRV.Reset();
+        g_headInstanceBuf[layer].buffer.Reset();
+        g_headInstanceBuf[layer].capacity = 0;
+        g_trailInstanceBuf[layer].buffer.Reset();
+        g_trailInstanceBuf[layer].capacity = 0;
     }
-    g_trailTarget.Reset();
-    g_fadeBrush.Reset();
-    g_renderTarget.Reset();
+    g_trailTexture.Reset();
+    g_trailRTV.Reset();
+    g_trailSRV.Reset();
+    g_backBufferRTV.Reset();
+    g_d2dContext.Reset();
+    g_d2dDevice.Reset();
+    g_vertexShader.Reset();
+    g_pixelShader.Reset();
+    g_inputLayout.Reset();
+    g_quadVertexBuffer.Reset();
+    g_viewportCB.Reset();
+    g_samplerState.Reset();
+    g_premulAlphaBlend.Reset();
+    g_opaqueBlend.Reset();
+    g_whiteTexture.Reset();
+    g_whiteSRV.Reset();
+    g_swapChain.Reset();
+    g_d3dContext.Reset();
+    g_d3dDevice.Reset();
 }
 
-static HRESULT InitDirect2D(HWND hwnd) {
-    HRESULT hr = D2D1CreateFactory<ID2D1Factory>(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2dFactory.GetAddressOf());
-    if (FAILED(hr)) return hr;
+static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int width = rc.right - rc.left, height = rc.bottom - rc.top;
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+
+    HRESULT hr = CreateD3DDeviceAndSwapChain(hwnd, width, height);
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateD3DDeviceAndSwapChain"; return hr; }
+
+    hr = D2D1CreateFactory<ID2D1Factory1>(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2dFactory.GetAddressOf());
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"D2D1CreateFactory"; return hr; }
+
+    ComPtr<IDXGIDevice> dxgiDevice;
+    hr = g_d3dDevice.As(&dxgiDevice);
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"QueryIDXGIDevice"; return hr; }
+    hr = g_d2dFactory->CreateDevice(dxgiDevice.Get(), &g_d2dDevice);
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"D2D1Factory::CreateDevice"; return hr; }
+    hr = g_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_d2dContext);
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateDeviceContext"; return hr; }
 
     hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_dwriteFactory.GetAddressOf()));
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"DWriteCreateFactory"; return hr; }
 
-    hr = CreateDeviceResources(hwnd);
-    if (FAILED(hr)) return hr;
+    {
+        const wchar_t* pipelineCall = nullptr;
+        hr = CreatePipelineObjects(&pipelineCall);
+        if (FAILED(hr)) {
+            if (failedStage) {
+                static wchar_t detailBuf[128];
+                swprintf_s(detailBuf, L"CreatePipelineObjects / %s", pipelineCall ? pipelineCall : L"(unknown)");
+                *failedStage = detailBuf;
+            }
+            return hr;
+        }
+    }
+
+    hr = CreateSizeDependentResources(width, height);
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateSizeDependentResources"; return hr; }
 
     for (int i = 0; i < NUM_LAYERS; ++i) {
         hr = BuildAtlasForLayer(i);
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) { if (failedStage) *failedStage = L"BuildAtlasForLayer"; return hr; }
     }
     return S_OK;
+}
+
+static HRESULT EnsureInstanceCapacity(LayerInstanceBuffer& lib, UINT needed) {
+    if (needed <= lib.capacity && lib.buffer) return S_OK;
+    // Grow with slack so we're not reallocating every time the visible
+    // glyph count fluctuates by one.
+    UINT newCapacity = lib.capacity == 0 ? 64 : lib.capacity;
+    while (newCapacity < needed) newCapacity += newCapacity / 2 + 8;
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = newCapacity * sizeof(GlyphInstance);
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    lib.buffer.Reset();
+    HRESULT hr = g_d3dDevice->CreateBuffer(&bd, nullptr, &lib.buffer);
+    if (FAILED(hr)) { lib.capacity = 0; return hr; }
+    lib.capacity = newCapacity;
+    return S_OK;
+}
+
+static HRESULT UploadInstances(LayerInstanceBuffer& lib, const std::vector<GlyphInstance>& data) {
+    if (data.empty()) return S_OK;
+    HRESULT hr = EnsureInstanceCapacity(lib, static_cast<UINT>(data.size()));
+    if (FAILED(hr)) return hr;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = g_d3dContext->Map(lib.buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) return hr;
+    memcpy(mapped.pData, data.data(), data.size() * sizeof(GlyphInstance));
+    g_d3dContext->Unmap(lib.buffer.Get(), 0);
+    return S_OK;
+}
+
+static void DrawInstanced(ID3D11ShaderResourceView* srv, LayerInstanceBuffer& lib, UINT count) {
+    if (count == 0 || !lib.buffer) return;
+    ID3D11Buffer* buffers[2] = { g_quadVertexBuffer.Get(), lib.buffer.Get() };
+    UINT strides[2] = { sizeof(float) * 2, sizeof(GlyphInstance) };
+    UINT offsets[2] = { 0, 0 };
+    g_d3dContext->IASetVertexBuffers(0, 2, buffers, strides, offsets);
+    g_d3dContext->PSSetShaderResources(0, 1, &srv);
+    g_d3dContext->DrawInstanced(4, count, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
 // Frame Rendering
 // ---------------------------------------------------------------------------
 static void DrawFrame(DWORD tickCount) {
-    if (!g_renderTarget || !g_trailTarget) return;
+    if (!g_d3dContext || !g_trailRTV || !g_backBufferRTV) return;
 
-    g_trailTarget->BeginDraw();
-    g_trailTarget->FillRectangle(D2D1::RectF(0, 0, static_cast<float>(g_width), static_cast<float>(g_height)), g_fadeBrush.Get());
+    // --- Simulation + instance-list build (unchanged math, new sink) -------
+    for (int layer = 0; layer < NUM_LAYERS; ++layer) {
+        g_headScratch[layer].clear();
+        g_trailScratch[layer].clear();
+    }
 
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         const LayerConfig& cfg = LAYER_CONFIGS[layer];
         const GlyphAtlas& atlas = g_atlases[layer];
         const float cellF = static_cast<float>(atlas.cellWidth);
+        const float brightness = cfg.brightnessMul;
 
         for (size_t colIdx : g_columnsByLayer[layer]) {
             ColumnState& col = g_columns[colIdx];
@@ -348,41 +756,120 @@ static void DrawFrame(DWORD tickCount) {
                 s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f;
                 if (s.y > g_height) s.y = -static_cast<float>(cfg.fontSize);
 
-                // Skip the draw call entirely for glyphs currently outside
-                // the visible viewport (e.g. trailing symbols still above
-                // frame, or a symbol mid-wrap). Position/state still update
-                // above so parallax speed, wrapping, and depth ordering are
-                // completely unaffected - this only avoids issuing a
-                // DrawBitmap call for something that would render nothing.
+                // Skip glyphs currently outside the visible viewport (e.g.
+                // trailing symbols still above frame, or mid-wrap). Position
+                // still updates above so parallax speed, wrapping, and depth
+                // ordering are unaffected - this only avoids adding an
+                // instance for something that would render nothing.
                 if (s.y + cellF < 0.0f || s.y > static_cast<float>(g_height)) continue;
 
                 int glyphIndex = static_cast<int>(s.value) - 0x30A0;
                 if (glyphIndex < 0 || glyphIndex >= atlas.glyphCount) continue;
 
-                D2D1_RECT_F srcRect = D2D1::RectF(glyphIndex * cellF, 0.0f, glyphIndex * cellF + cellF, cellF);
-                D2D1_RECT_F destRect = D2D1::RectF(static_cast<float>(col.x), s.y, static_cast<float>(col.x) + cellF, s.y + cellF);
+                const float u0 = glyphIndex / static_cast<float>(atlas.glyphCount);
+                const float u1 = (glyphIndex + 1) / static_cast<float>(atlas.glyphCount);
 
-                ID2D1Bitmap* bmp = s.isHead ? atlas.headBitmap.Get() : atlas.trailBitmap.Get();
-                g_trailTarget->DrawBitmap(bmp, destRect, cfg.brightnessMul, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, srcRect);
+                GlyphInstance inst;
+                inst.destX = static_cast<float>(col.x);
+                inst.destY = s.y;
+                inst.destW = cellF;
+                inst.destH = cellF;
+                inst.u0 = u0; inst.v0 = 0.0f;
+                inst.u1 = u1; inst.v1 = 1.0f;
+                // Premultiplied tint: atlas rgb is already baked with the
+                // layer's head/trail color at full alpha, so scaling all
+                // four channels by brightnessMul reduces both opacity and
+                // premultiplied color together, matching the original
+                // DrawBitmap(..., opacity, ...) call exactly.
+                inst.colorR = inst.colorG = inst.colorB = inst.colorA = brightness;
+
+                if (s.isHead) g_headScratch[layer].push_back(inst);
+                else          g_trailScratch[layer].push_back(inst);
             }
         }
     }
-    g_trailTarget->EndDraw();
 
-    ComPtr<ID2D1Bitmap> trailBitmap;
-    g_trailTarget->GetBitmap(&trailBitmap);
+    // --- Upload viewport constant buffer (shared by every draw this frame) -
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(g_d3dContext->Map(g_viewportCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        float vp[4] = { static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, 0.0f };
+        memcpy(mapped.pData, vp, sizeof(vp));
+        g_d3dContext->Unmap(g_viewportCB.Get(), 0);
+    }
 
-    g_renderTarget->BeginDraw();
-    g_renderTarget->DrawBitmap(trailBitmap.Get(), D2D1::RectF(0, 0, static_cast<float>(g_width), static_cast<float>(g_height)));
-    HRESULT hr = g_renderTarget->EndDraw();
+    // --- Common pipeline state, shared by all draws this frame -------------
+    UINT stride = sizeof(float) * 2, offset = 0;
+    g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g_d3dContext->IASetInputLayout(g_inputLayout.Get());
+    g_d3dContext->VSSetShader(g_vertexShader.Get(), nullptr, 0);
+    g_d3dContext->VSSetConstantBuffers(0, 1, g_viewportCB.GetAddressOf());
+    g_d3dContext->PSSetShader(g_pixelShader.Get(), nullptr, 0);
+    g_d3dContext->PSSetSamplers(0, 1, g_samplerState.GetAddressOf());
 
-    if (hr == D2DERR_RECREATE_TARGET) {
+    D3D11_VIEWPORT vp = { 0, 0, static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, 1.0f };
+    g_d3dContext->RSSetViewports(1, &vp);
+
+    // --- Pass 1: fade + glyphs into the persistent trail buffer -------------
+    const float blendFactor[4] = { 0, 0, 0, 0 };
+    g_d3dContext->OMSetRenderTargets(1, g_trailRTV.GetAddressOf(), nullptr);
+    g_d3dContext->OMSetBlendState(g_premulAlphaBlend.Get(), blendFactor, 0xFFFFFFFF);
+
+    GlyphInstance fadeInst{};
+    fadeInst.destX = 0; fadeInst.destY = 0;
+    fadeInst.destW = static_cast<float>(g_width);
+    fadeInst.destH = static_cast<float>(g_height);
+    fadeInst.u0 = fadeInst.v0 = 0.0f; fadeInst.u1 = fadeInst.v1 = 1.0f;
+    fadeInst.colorR = fadeInst.colorG = fadeInst.colorB = 0.0f;
+    fadeInst.colorA = 0.16f;
+    static std::vector<GlyphInstance> fadeScratch(1);
+    fadeScratch[0] = fadeInst;
+    static LayerInstanceBuffer fadeBuf;
+    UploadInstances(fadeBuf, fadeScratch);
+    DrawInstanced(g_whiteSRV.Get(), fadeBuf, 1);
+
+    for (int layer = 0; layer < NUM_LAYERS; ++layer) {
+        const GlyphAtlas& atlas = g_atlases[layer];
+        if (!g_trailScratch[layer].empty()) {
+            UploadInstances(g_trailInstanceBuf[layer], g_trailScratch[layer]);
+            DrawInstanced(atlas.trailSRV.Get(), g_trailInstanceBuf[layer], static_cast<UINT>(g_trailScratch[layer].size()));
+        }
+        if (!g_headScratch[layer].empty()) {
+            UploadInstances(g_headInstanceBuf[layer], g_headScratch[layer]);
+            DrawInstanced(atlas.headSRV.Get(), g_headInstanceBuf[layer], static_cast<UINT>(g_headScratch[layer].size()));
+        }
+    }
+
+    // --- Pass 2: composite trail buffer onto the backbuffer (opaque) -------
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    g_d3dContext->PSSetShaderResources(0, 1, &nullSRV); // unbind before rebinding trail texture as RTV->SRV
+    g_d3dContext->OMSetRenderTargets(1, g_backBufferRTV.GetAddressOf(), nullptr);
+    g_d3dContext->OMSetBlendState(g_opaqueBlend.Get(), blendFactor, 0xFFFFFFFF);
+
+    GlyphInstance compositeInst{};
+    compositeInst.destX = 0; compositeInst.destY = 0;
+    compositeInst.destW = static_cast<float>(g_width);
+    compositeInst.destH = static_cast<float>(g_height);
+    compositeInst.u0 = compositeInst.v0 = 0.0f; compositeInst.u1 = compositeInst.v1 = 1.0f;
+    compositeInst.colorR = compositeInst.colorG = compositeInst.colorB = compositeInst.colorA = 1.0f;
+    static std::vector<GlyphInstance> compositeScratch(1);
+    compositeScratch[0] = compositeInst;
+    static LayerInstanceBuffer compositeBuf;
+    UploadInstances(compositeBuf, compositeScratch);
+    DrawInstanced(g_trailSRV.Get(), compositeBuf, 1);
+
+    // Sync-interval 1 paces presentation to vsync (same intent as the
+    // earlier D2D1_PRESENT_OPTIONS_NONE change) rather than flipping as
+    // fast as possible.
+    HRESULT hr = g_swapChain->Present(1, 0);
+
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         DiscardDeviceResources();
-        if (SUCCEEDED(CreateDeviceResources(g_hwnd))) {
-            for (int i = 0; i < NUM_LAYERS; ++i) BuildAtlasForLayer(i);
+        if (SUCCEEDED(InitDirect2D(g_hwnd))) {
+            InitColumns(g_width, g_height);
         }
     }
 }
+
 
 static void ResetMouseTracking(HWND hwnd) {
     GetCursorPos(&g_lastMousePos);
@@ -403,8 +890,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SeedFastRng(static_cast<uint32_t>(time(nullptr)) ^ static_cast<uint32_t>(GetTickCount64()));
         g_startTick = GetTickCount64();
 
-        if (FAILED(InitDirect2D(hwnd))) {
-            MessageBoxW(hwnd, L"Direct2D initialization failed.", L"Matrix Screensaver", MB_OK | MB_ICONERROR);
+        const wchar_t* failedStage = L"(unknown)";
+        HRESULT initHr = InitDirect2D(hwnd, &failedStage);
+        if (FAILED(initHr)) {
+            wchar_t msg[192];
+            swprintf_s(msg, L"Direct2D/D3D11 initialization failed.\nStage: %s\nHRESULT: 0x%08X", failedStage, static_cast<unsigned int>(initHr));
+            MessageBoxW(hwnd, msg, L"Matrix Screensaver", MB_OK | MB_ICONERROR);
             DestroyWindow(hwnd);
             return 0;
         }
@@ -436,24 +927,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
     case WM_SIZE: {
         g_isVisible = (wParam != SIZE_MINIMIZED);
-        if (g_renderTarget) {
+        if (g_swapChain) {
             RECT rc;
             GetClientRect(hwnd, &rc);
-            g_width = rc.right - rc.left;
-            g_height = rc.bottom - rc.top;
-            D2D1_SIZE_U size = D2D1::SizeU(g_width, g_height);
-            g_renderTarget->Resize(size);
+            int newWidth = rc.right - rc.left;
+            int newHeight = rc.bottom - rc.top;
+            if (newWidth < 1) newWidth = 1;
+            if (newHeight < 1) newHeight = 1;
 
-            // g_trailTarget (the offscreen bitmap render target holding the
-            // fading trail buffer) must be rebuilt here at the new size and
-            // the columns reseeded so the rain layout matches the new bounds.
-            g_trailTarget.Reset();
-            if (SUCCEEDED(g_renderTarget->CreateCompatibleRenderTarget(&g_trailTarget))) {
-                g_trailTarget->BeginDraw();
-                g_trailTarget->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-                g_trailTarget->EndDraw();
+            // Nothing to do if the size didn't actually change (e.g. a
+            // restore-from-minimize that lands back at the same client
+            // rect) - avoids tearing down/rebuilding the swap chain buffers
+            // for free.
+            if (newWidth != g_width || newHeight != g_height) {
+                g_width = newWidth;
+                g_height = newHeight;
+
+                // Release everything that holds a reference to the swap
+                // chain's back buffer or is sized off the old client area
+                // before calling ResizeBuffers - D3D11 refuses to resize
+                // while views onto the old buffers are still alive.
+                g_d3dContext->OMSetRenderTargets(0, nullptr, nullptr);
+                g_backBufferRTV.Reset();
+                g_trailRTV.Reset();
+                g_trailSRV.Reset();
+                g_trailTexture.Reset();
+
+                HRESULT hr = g_swapChain->ResizeBuffers(0, static_cast<UINT>(g_width),
+                    static_cast<UINT>(g_height), DXGI_FORMAT_UNKNOWN, 0);
+                if (SUCCEEDED(hr)) {
+                    hr = CreateSizeDependentResources(g_width, g_height);
+                }
+
+                if (FAILED(hr)) {
+                    // Swap chain is in an unrecoverable state at this size -
+                    // fall back to the same full rebuild path used for
+                    // device-removed/reset, same as DrawFrame does.
+                    DiscardDeviceResources();
+                    if (SUCCEEDED(InitDirect2D(hwnd))) {
+                        InitColumns(g_width, g_height);
+                    }
+                    return 0;
+                }
+
+                // The persistent trail buffer was just recreated at the new
+                // size (and cleared to black in CreateSizeDependentResources),
+                // so the rain layout is reseeded to match the new bounds -
+                // same intent as the old g_trailTarget rebuild-and-clear.
+                InitColumns(g_width, g_height);
             }
-            InitColumns(g_width, g_height);
         }
         return 0;
     }
