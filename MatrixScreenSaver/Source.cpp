@@ -55,6 +55,7 @@ struct Symbol {
     wchar_t value = L' ';
     int     interval = 0;
     bool    isHead = false;
+    DWORD   nextChangeTick = 0; // precomputed tick at which value will re-roll
 };
 
 struct ColumnState {
@@ -98,6 +99,7 @@ static bool InGracePeriod() { return (GetTickCount64() - g_startTick) < STARTUP_
 
 static POINT g_lastMousePos{};
 static bool  g_mouseInit = false;
+static bool  g_isVisible = true; // false while minimized/fully occluded
 
 // ---------------------------------------------------------------------------
 // Matrix Cascade Random String Generation Engine
@@ -163,6 +165,7 @@ static void InitColumns(int width, int height) {
                 s.value = RandomKatakana();
                 s.interval = 5 + static_cast<int>(FastRandBounded(25));
                 s.isHead = (i == 0);
+                s.nextChangeTick = static_cast<DWORD>(FastRandBounded(static_cast<uint32_t>(s.interval)));
                 col.symbols.push_back(s);
             }
             g_columns.push_back(std::move(col));
@@ -306,13 +309,25 @@ static void DrawFrame(DWORD tickCount) {
             ColumnState& col = g_columns[colIdx];
 
             for (auto& s : col.symbols) {
-                if (s.interval > 0 && (tickCount % s.interval) == 0) {
+                // Precomputed-tick re-roll: avoids a modulo per symbol per
+                // frame. Only recomputes the next trigger tick when it
+                // actually fires, instead of testing (tickCount % interval)
+                // every single frame for every symbol.
+                if (s.interval > 0 && tickCount >= s.nextChangeTick) {
                     s.value = RandomKatakana();
+                    s.nextChangeTick = tickCount + static_cast<DWORD>(s.interval);
                 }
 
-                // SPEED CHANGE!
                 s.y += static_cast<float>(s.speed) * cfg.speedMul * 1.4f;
                 if (s.y > g_height) s.y = -static_cast<float>(cfg.fontSize);
+
+                // Skip the draw call entirely for glyphs currently outside
+                // the visible viewport (e.g. trailing symbols still above
+                // frame, or a symbol mid-wrap). Position/state still update
+                // above so parallax speed, wrapping, and depth ordering are
+                // completely unaffected - this only avoids issuing a
+                // DrawBitmap call for something that would render nothing.
+                if (s.y + cellF < 0.0f || s.y > static_cast<float>(g_height)) continue;
 
                 int glyphIndex = static_cast<int>(s.value) - 0x30A0;
                 if (glyphIndex < 0 || glyphIndex >= atlas.glyphCount) continue;
@@ -375,7 +390,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_TIMER: {
-        DrawFrame(static_cast<DWORD>(GetTickCount64()));
+        // Skip rendering entirely while minimized or fully occluded - the
+        // animation state (positions, glyphs) simply doesn't advance during
+        // that time, same as if the timer had never fired. No frames are
+        // dropped or skipped while actually on screen.
+        if (g_isVisible) DrawFrame(static_cast<DWORD>(GetTickCount64()));
+        return 0;
+    }
+    case WM_SHOWWINDOW: {
+        g_isVisible = (wParam != 0);
         return 0;
     }
     case WM_PAINT: {
@@ -385,6 +408,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_SIZE: {
+        g_isVisible = (wParam != SIZE_MINIMIZED);
         if (g_renderTarget) {
             RECT rc;
             GetClientRect(hwnd, &rc);
