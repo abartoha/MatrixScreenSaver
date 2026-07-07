@@ -18,6 +18,7 @@
 #include <ctime>
 #include <cmath>
 #include <windows.h>
+#include <shellscalingapi.h>
 #include <psapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -46,7 +47,7 @@
 // bookkeeping (PDH queries, DXGI memory queries, frame-time history, HUD
 // drawing). Set to 1 to include it (still toggleable at runtime with the 'B'
 // key when enabled here).
-#define ENABLE_BENCHMARK_OVERLAY 1
+#define ENABLE_BENCHMARK_OVERLAY 0
 
 // Set to 1 to disable vsync (Present(0,0)) and let the render loop run as fast
 // as the GPU can produce frames, uncapped by the monitor's refresh rate. This
@@ -313,7 +314,28 @@ static void InitColumns(int width, int height) {
             col.layer = layer;
             col.speed = 4 + static_cast<int>(FastRandBounded(6));
             col.length = 4 + static_cast<int>(FastRandBounded(36));
-            int startY = (height > 0) ? -static_cast<int>(FastRandBounded(static_cast<uint32_t>(height))) : 0;
+
+            // Seed the column's head somewhere across the *entire* fall range
+            // (from fully above the screen down to fully below it), not just
+            // above it. Previously every column always started above y=0 and
+            // had to fall into view over time, so a freshly-created window
+            // that only gets to render a handful of frames -- most notably
+            // the tiny preview thumbnail in the screensaver picker, which the
+            // OS only pumps for a brief moment before snapshotting it -- would
+            // show a mature-looking top half (near the spawn point) and a
+            // completely empty, solid-black bottom half (never reached yet).
+            // Distributing the initial head position across the full height
+            // (with some overflow above/below for a natural, already-falling
+            // look) makes the very first rendered frame already resemble a
+            // steady-state cascade, so short-lived render contexts like the
+            // preview look correct immediately instead of only "warming up"
+            // after several seconds of continuous animation.
+            int spawnRangeTop = -(col.length * cfg.fontSize);
+            int spawnRangeBottom = (height > 0) ? height : 0;
+            int spawnSpan = spawnRangeBottom - spawnRangeTop;
+            int startY = (spawnSpan > 0)
+                ? spawnRangeTop + static_cast<int>(FastRandBounded(static_cast<uint32_t>(spawnSpan)))
+                : 0;
 
             col.symbols.reserve(col.length);
             for (int i = 0; i < col.length; ++i) {
@@ -1550,6 +1572,43 @@ static void ShowConfigDialog(HINSTANCE hInstance, HWND ownerHwnd) {
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(nCmdShow);
+
+    // Declare Per-Monitor-V2 DPI awareness *before* creating any window or
+    // calling GetClientRect. Without this, an unaware process gets silently
+    // DPI-virtualized by Windows: the OS renders our window into a smaller
+    // backing buffer sized for 96 DPI and then bitmap-stretches it to fit
+    // the "logical" (scaled) window rect it told us about. That mismatch is
+    // especially visible for the screensaver picker's preview thumbnail --
+    // a child window embedded inside a foreign, DPI-aware Control Panel
+    // dialog -- where our unaware child ends up rendering into a fraction of
+    // the space the dialog actually gave it (the rest is simply left
+    // unpainted, appearing as a dark region). Declaring awareness up front
+    // makes GetClientRect/CreateWindowExW/D3D swap chain sizes all agree in
+    // real physical pixels, with no OS-level stretching anywhere.
+    //
+    // SetProcessDpiAwarenessContext is the modern API (Windows 10 1703+).
+    // Fall back to SetProcessDpiAwareness (8.1+) and finally
+    // SetProcessDPIAware (Vista+) for robustness on older systems, since this
+    // ships as a plain .scr/.exe without an application manifest declaring
+    // DPI awareness statically.
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    using SetCtxFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    auto setCtx = user32 ? reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext")) : nullptr;
+    if (setCtx && setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+        // Success on Windows 10 1703+.
+    }
+    else {
+        HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+        using SetAwarenessFn = HRESULT(WINAPI*)(PROCESS_DPI_AWARENESS);
+        auto setAwareness = shcore ? reinterpret_cast<SetAwarenessFn>(GetProcAddress(shcore, "SetProcessDpiAwareness")) : nullptr;
+        if (setAwareness) {
+            setAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+        }
+        else {
+            SetProcessDPIAware();
+        }
+        if (shcore) FreeLibrary(shcore);
+    }
 
     std::wstring cmd(lpCmdLine ? lpCmdLine : L"");
     auto lower = cmd;
