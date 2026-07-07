@@ -46,7 +46,7 @@
 // bookkeeping (PDH queries, DXGI memory queries, frame-time history, HUD
 // drawing). Set to 1 to include it (still toggleable at runtime with the 'B'
 // key when enabled here).
-#define ENABLE_BENCHMARK_OVERLAY 0
+#define ENABLE_BENCHMARK_OVERLAY 1
 
 // Set to 1 to disable vsync (Present(0,0)) and let the render loop run as fast
 // as the GPU can produce frames, uncapped by the monitor's refresh rate. This
@@ -1340,7 +1340,9 @@ static void DrawFrame(DWORD tickCount) {
     // tearing and minimal wasted GPU work.
     HRESULT hr = g_swapChain->Present(1, 0);
 #endif
+#if ENABLE_BENCHMARK_OVERLAY
     if (FAILED(hr)) ++g_droppedPresentCount;
+#endif
 
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         DiscardDeviceResources();
@@ -1479,13 +1481,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_KEYDOWN:
         // 'B' toggles the benchmark/diagnostics overlay without exiting the
         // screensaver, so you can check performance without losing the session.
-        // Only honored in preview/windowed contexts or during the grace period
-        // isn't required here since toggling isn't destructive; any other key
-        // still exits as before.
+        // Only meaningful when the overlay is compiled in; when
+        // ENABLE_BENCHMARK_OVERLAY is 0, 'B' falls through and exits like any
+        // other key, since there's nothing to toggle.
+#if ENABLE_BENCHMARK_OVERLAY
         if (wParam == 'B') {
             g_benchEnabled = !g_benchEnabled;
             return 0;
         }
+#endif
         if (!g_isPreview && !InGracePeriod()) DestroyWindow(hwnd);
         return 0;
 
