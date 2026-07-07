@@ -1,4 +1,4 @@
-// MatrixScreensaver.cpp
+// Source.cpp
 // A GPU-accelerated Windows screensaver (.scr) implementing a falling-katakana
 // "Matrix rain" effect using Direct3D11 instanced rendering, with multiple
 // parallax depth layers. Direct2D + DirectWrite are used only once at
@@ -10,17 +10,23 @@
 #define NOMINMAX
 #include <vector>
 #include <string>
+#include <deque>
+#include <numeric>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
 #include <windows.h>
+#include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <d2d1.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #pragma comment(lib, "d2d1.lib")
@@ -30,8 +36,36 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "Pdh.lib")
+
+// ---------------------------------------------------------------------------
+// Build-time switches
+// ---------------------------------------------------------------------------
+// Set to 0 to fully compile out the benchmark/diagnostics overlay and all its
+// bookkeeping (PDH queries, DXGI memory queries, frame-time history, HUD
+// drawing). Set to 1 to include it (still toggleable at runtime with the 'B'
+// key when enabled here).
+#define ENABLE_BENCHMARK_OVERLAY 1
+
+// Set to 1 to disable vsync (Present(0,0)) and let the render loop run as fast
+// as the GPU can produce frames, uncapped by the monitor's refresh rate. This
+// is mainly useful for measuring true max GPU throughput. Leave at 0 for
+// normal use: Present(1,0) paces the loop to the monitor's native refresh
+// rate (e.g. 144Hz on a 144Hz display), which is smooth and power-efficient.
+#define UNCAP_FRAMERATE 0
 
 using Microsoft::WRL::ComPtr;
+
+// ---------------------------------------------------------------------------
+// Hints to the OS/driver to prefer the high-performance (discrete) GPU on
+// hybrid (Optimus/AMD Switchable Graphics) laptops. These are read by the
+// NVIDIA and AMD drivers respectively when present as exports of the .exe.
+// ---------------------------------------------------------------------------
+extern "C" {
+    __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+    __declspec(dllexport) int   AmdPowerXpressRequestHighPerformance = 1;
+}
 
 // ---------------------------------------------------------------------------
 // Configuration / Windowing Defaults
@@ -80,25 +114,16 @@ struct ColumnState {
 static HWND  g_hwnd = nullptr;
 static int   g_width = 0, g_height = 0;
 static std::vector<ColumnState> g_columns;
-// Column indices bucketed per layer so DrawFrame can iterate each column
-// exactly once per frame instead of scanning the full column list once
-// per layer (was O(NUM_LAYERS * columns), now O(columns)).
 static std::vector<std::vector<size_t>> g_columnsByLayer;
 
 // ---------------------------------------------------------------------------
 // Direct3D11 Pipeline Core
 // ---------------------------------------------------------------------------
-// One instanced draw call renders every visible glyph for a given
-// (layer, head-or-trail) atlas in a single GPU submission, replacing what
-// used to be one DrawBitmap call per visible glyph.
 static ComPtr<ID3D11Device>           g_d3dDevice;
 static ComPtr<ID3D11DeviceContext>    g_d3dContext;
 static ComPtr<IDXGISwapChain>         g_swapChain;
 static ComPtr<ID3D11RenderTargetView> g_backBufferRTV;
 
-// Persistent offscreen trail buffer (equivalent to the old g_trailTarget):
-// never cleared between frames, only faded via a translucent black quad,
-// so the falling-glyph trails accumulate exactly as before.
 static ComPtr<ID3D11Texture2D>          g_trailTexture;
 static ComPtr<ID3D11RenderTargetView>   g_trailRTV;
 static ComPtr<ID3D11ShaderResourceView> g_trailSRV;
@@ -106,25 +131,19 @@ static ComPtr<ID3D11ShaderResourceView> g_trailSRV;
 static ComPtr<ID3D11VertexShader>  g_vertexShader;
 static ComPtr<ID3D11PixelShader>   g_pixelShader;
 static ComPtr<ID3D11InputLayout>   g_inputLayout;
-static ComPtr<ID3D11Buffer>        g_quadVertexBuffer;   // static unit quad, 4 verts
-static ComPtr<ID3D11Buffer>        g_viewportCB;          // b0: viewport size
+static ComPtr<ID3D11Buffer>        g_quadVertexBuffer;
+static ComPtr<ID3D11Buffer>        g_viewportCB;
 static ComPtr<ID3D11SamplerState>  g_samplerState;
-static ComPtr<ID3D11BlendState>    g_premulAlphaBlend;    // fade + glyph draws into trail buffer
-static ComPtr<ID3D11BlendState>    g_opaqueBlend;         // final composite to backbuffer
-static ComPtr<ID3D11Texture2D>     g_whiteTexture;        // 1x1 opaque white, used for the fade quad
+static ComPtr<ID3D11BlendState>    g_premulAlphaBlend;
+static ComPtr<ID3D11BlendState>    g_opaqueBlend;
+static ComPtr<ID3D11Texture2D>     g_whiteTexture;
 static ComPtr<ID3D11ShaderResourceView> g_whiteSRV;
 
-// D2D/DWrite are retained solely to rasterize the glyph atlases (one-time,
-// at startup and on resize) via D3D11 interop; they never touch the
-// per-frame render path.
 static ComPtr<ID2D1Factory1>      g_d2dFactory;
 static ComPtr<ID2D1Device>        g_d2dDevice;
 static ComPtr<ID2D1DeviceContext> g_d2dContext;
 static ComPtr<IDWriteFactory>     g_dwriteFactory;
 
-// Per-instance data uploaded to the GPU for one glyph quad. destPos/destSize
-// are in pixels; uv0/uv1 select the glyph's cell within the atlas strip;
-// color is a premultiplied-alpha tint (brightnessMul baked in per layer).
 struct GlyphInstance {
     float destX, destY;
     float destW, destH;
@@ -142,18 +161,13 @@ struct GlyphAtlas {
 };
 static GlyphAtlas g_atlases[NUM_LAYERS];
 
-// Dynamic instance buffers, one pair per layer (head/trail), resized as
-// needed and refilled every frame. Kept as persistent D3D11 dynamic buffers
-// so we're not allocating/destroying GPU resources every frame.
 struct LayerInstanceBuffer {
     ComPtr<ID3D11Buffer> buffer;
-    UINT capacity = 0; // in instances
+    UINT capacity = 0;
 };
 static LayerInstanceBuffer g_headInstanceBuf[NUM_LAYERS];
 static LayerInstanceBuffer g_trailInstanceBuf[NUM_LAYERS];
 
-// CPU-side scratch, refilled each frame, reused across frames to avoid
-// reallocating the vectors constantly.
 static std::vector<GlyphInstance> g_headScratch[NUM_LAYERS];
 static std::vector<GlyphInstance> g_trailScratch[NUM_LAYERS];
 
@@ -164,16 +178,86 @@ static bool InGracePeriod() { return (GetTickCount64() - g_startTick) < STARTUP_
 
 static POINT g_lastMousePos{};
 static bool  g_mouseInit = false;
-static bool  g_isVisible = true; // false while minimized/fully occluded
+static bool  g_isVisible = true;
+
+// ---------------------------------------------------------------------------
+// Benchmark / Diagnostics Overlay
+// ---------------------------------------------------------------------------
+#if ENABLE_BENCHMARK_OVERLAY
+// Toggle overlay with the "B" key (does not exit the screensaver, since normal
+// key input already exits; the toggle is handled specially in WndProc before
+// the exit-on-keypress logic runs).
+static bool g_benchEnabled = true;
+
+struct AdapterInfo {
+    std::wstring description;
+    SIZE_T       dedicatedVideoMemory = 0;
+    SIZE_T       dedicatedSystemMemory = 0;
+    SIZE_T       sharedSystemMemory = 0;
+    UINT         vendorId = 0;
+    UINT         deviceId = 0;
+    bool         isChosen = false;
+    bool         likelyDiscrete = false;
+};
+
+static std::vector<AdapterInfo> g_allAdapters;
+static AdapterInfo              g_chosenAdapter;
+static std::wstring             g_adapterSelectionNote;
+
+// Frame timing
+static LARGE_INTEGER g_qpcFrequency{};
+static LARGE_INTEGER g_lastFrameQpc{};
+static std::deque<double> g_frameTimesMs;      // rolling window, in ms
+static const size_t       kFrameHistoryMax = 240; // ~4s at 60fps
+static double g_currentFps = 0.0;
+static double g_avgFrameMs = 0.0;
+static double g_minFrameMs = 0.0;
+static double g_maxFrameMs = 0.0;
+static double g_p99FrameMs = 0.0;
+static UINT64 g_totalFramesRendered = 0;
+static UINT64 g_droppedPresentCount = 0; // Present() calls that returned an error
+
+// CPU usage (process vs total system) via PDH
+static PDH_HQUERY   g_pdhQuery = nullptr;
+static PDH_HCOUNTER g_pdhProcessCpuCounter = nullptr;
+static PDH_HCOUNTER g_pdhTotalCpuCounter = nullptr;
+static double g_processCpuPercent = 0.0;
+static double g_systemCpuPercent = 0.0;
+static int    g_logicalCoreCount = 1;
+
+// Memory usage
+static SIZE_T g_processWorkingSetBytes = 0;
+static SIZE_T g_processPrivateBytes = 0;
+static DWORDLONG g_systemTotalPhysBytes = 0;
+static DWORDLONG g_systemUsedPhysBytes = 0;
+static double g_systemMemPercent = 0.0;
+
+// GPU memory (best-effort, via DXGI budget query on the chosen adapter)
+static SIZE_T g_gpuVideoMemUsedBytes = 0;
+static SIZE_T g_gpuVideoMemBudgetBytes = 0;
+static ComPtr<IDXGIAdapter3> g_dxgiAdapter3; // optional, for QueryVideoMemoryInfo
+
+// Diagnostics refresh cadence: don't hammer PDH/DXGI budget queries every frame
+static ULONGLONG g_lastStatsRefreshTick = 0;
+static const ULONGLONG STATS_REFRESH_INTERVAL_MS = 500;
+
+// D2D text resources for the overlay (created alongside other size-dependent resources)
+static ComPtr<IDWriteTextFormat>    g_overlayTextFormat;
+static ComPtr<ID2D1SolidColorBrush> g_overlayTextBrush;
+static ComPtr<ID2D1SolidColorBrush> g_overlayBgBrush;
+static ComPtr<ID2D1Bitmap1>         g_overlayD2DTarget; // D2D view of the backbuffer, for direct overlay draw
+#endif // ENABLE_BENCHMARK_OVERLAY
+
+// Real-time frame pacing (always needed, independent of the benchmark overlay,
+// since DrawFrame's animation now advances by measured elapsed time rather
+// than a fixed per-tick assumption).
+static LARGE_INTEGER g_pacingQpcFrequency{};
+static LARGE_INTEGER g_pacingLastFrameQpc{};
+static bool          g_pacingInitialized = false;
 
 // ---------------------------------------------------------------------------
 // Matrix Cascade Random String Generation Engine
 // ---------------------------------------------------------------------------
-// MSVC's rand() has a period of only RAND_MAX (32767) and involves a global
-// lock, which is wasteful given how frequently this is called (every glyph,
-// every few frames, across every column). A small xorshift32 PRNG is faster,
-// branch-free, and has a far longer period; it's used purely for cosmetic
-// randomness so it doesn't need to be cryptographically strong.
 static uint32_t g_rngState = 0x9E3779B9u;
 
 static void SeedFastRng(uint32_t seed) {
@@ -189,9 +273,6 @@ static uint32_t FastRandU32() {
     return x;
 }
 
-// Returns a value in the half-open range [0, bound), using a widening
-// multiply instead of modulo to avoid the low-bit periodicity issues
-// xorshift generators can have with the '%' operator.
 static uint32_t FastRandBounded(uint32_t bound) {
     return static_cast<uint32_t>((static_cast<uint64_t>(FastRandU32()) * bound) >> 32);
 }
@@ -204,22 +285,12 @@ static wchar_t RandomKatakana() {
     return static_cast<wchar_t>(0x30A0 + FastRandBounded(KATAKANA_COUNT));
 }
 
-// Above this canvas area (roughly a single 1080p display), column count grows
-// linearly with area even though a human's perceived "density" only cares
-// about glyphs-per-visible-area. On large single displays, 4K panels, or
-// triple-monitor spans, that means far more live columns/symbols than the
-// effect was ever tuned for. We scale the density down above the threshold
-// so glyphs-per-area stays roughly constant instead of raw column count
-// growing unbounded. Below the threshold this is a no-op (scale == 1.0),
-// so normal single-monitor setups render identically to before.
 static const float DENSITY_BASELINE_AREA = 1920.0f * 1080.0f;
 
 static float ComputeDensityScale(int width, int height) {
     float area = static_cast<float>(width) * static_cast<float>(height);
     if (area <= DENSITY_BASELINE_AREA) return 1.0f;
     float scale = DENSITY_BASELINE_AREA / area;
-    // Floor it so extreme spans (e.g. 3x 4K) still keep a reasonable amount
-    // of visible rain rather than thinning out too aggressively.
     if (scale < 0.35f) scale = 0.35f;
     return scale;
 }
@@ -259,8 +330,6 @@ static void InitColumns(int width, int height) {
         }
     }
 
-    // Rebuild the per-layer index buckets once, right after g_columns is
-    // finalized, so DrawFrame never has to filter col.layer on every frame.
     g_columnsByLayer.assign(NUM_LAYERS, {});
     for (size_t i = 0; i < g_columns.size(); ++i) {
         g_columnsByLayer[g_columns[i].layer].push_back(i);
@@ -270,10 +339,6 @@ static void InitColumns(int width, int height) {
 // ---------------------------------------------------------------------------
 // Shader Source (compiled once at startup)
 // ---------------------------------------------------------------------------
-// Single shader pair handles all three draw kinds (fade quad, glyph
-// instances, final composite) by varying the bound texture and the
-// per-instance color tint. destPos/destSize are in pixels; the vertex
-// shader converts to NDC using the viewport-size constant buffer.
 static const char* kShaderSource = R"(
 cbuffer ViewportCB : register(b0) {
     float2 viewport;
@@ -331,16 +396,230 @@ static HRESULT CompileShader(const char* entryPoint, const char* target, ComPtr<
 }
 
 // ---------------------------------------------------------------------------
+// GPU Adapter Enumeration & Selection Reporting
+// ---------------------------------------------------------------------------
+#if ENABLE_BENCHMARK_OVERLAY
+// Well-known PCI vendor IDs used to guess discrete vs integrated when the
+// description string alone isn't conclusive.
+static bool VendorIsDiscreteLikely(UINT vendorId, const std::wstring& desc) {
+    // 0x10DE = NVIDIA (always discrete). 0x1002/0x1022 = AMD (mostly discrete,
+    // though AMD APUs share the ID; description text disambiguates below).
+    if (vendorId == 0x10DE) return true;
+    std::wstring lower = desc;
+    for (auto& ch : lower) ch = towlower(ch);
+    if (lower.find(L"intel") != std::wstring::npos) return false;
+    if (lower.find(L"microsoft basic render") != std::wstring::npos) return false;
+    if (lower.find(L"radeon") != std::wstring::npos && lower.find(L" graphics") != std::wstring::npos
+        && lower.find(L"rx") == std::wstring::npos) {
+        // Heuristic: "AMD Radeon(TM) Graphics" (no RX model number) is typically an APU.
+        return false;
+    }
+    if (vendorId == 0x1002 || vendorId == 0x1022) return true;
+    return false;
+}
+
+static void EnumerateAndSelectAdapter(IDXGIFactory1* factory, IDXGIAdapter* chosenByD3D) {
+    g_allAdapters.clear();
+    g_adapterSelectionNote.clear();
+
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+                AdapterInfo info;
+                info.description = desc.Description;
+                info.dedicatedVideoMemory = desc.DedicatedVideoMemory;
+                info.dedicatedSystemMemory = desc.DedicatedSystemMemory;
+                info.sharedSystemMemory = desc.SharedSystemMemory;
+                info.vendorId = desc.VendorId;
+                info.deviceId = desc.DeviceId;
+                info.likelyDiscrete = VendorIsDiscreteLikely(desc.VendorId, info.description);
+                g_allAdapters.push_back(info);
+            }
+        }
+        adapter.Reset();
+    }
+
+    // Identify which adapter D3D actually picked (by LUID match) and figure out
+    // whether a better (discrete, more VRAM) option exists that wasn't chosen.
+    DXGI_ADAPTER_DESC1 chosenDesc{};
+    bool haveChosenDesc = false;
+    if (chosenByD3D) {
+        ComPtr<IDXGIAdapter1> chosen1;
+        if (SUCCEEDED(chosenByD3D->QueryInterface(IID_PPV_ARGS(&chosen1)))) {
+            if (SUCCEEDED(chosen1->GetDesc1(&chosenDesc))) haveChosenDesc = true;
+        }
+    }
+
+    const AdapterInfo* bestAlternative = nullptr;
+    for (auto& a : g_allAdapters) {
+        bool isThisTheChosenOne = haveChosenDesc &&
+            (a.vendorId == chosenDesc.VendorId && a.deviceId == chosenDesc.DeviceId &&
+                a.dedicatedVideoMemory == chosenDesc.DedicatedVideoMemory);
+        a.isChosen = isThisTheChosenOne;
+        if (isThisTheChosenOne) g_chosenAdapter = a;
+
+        if (!isThisTheChosenOne && a.likelyDiscrete) {
+            if (!bestAlternative || a.dedicatedVideoMemory > bestAlternative->dedicatedVideoMemory) {
+                bestAlternative = &a;
+            }
+        }
+    }
+
+    if (!haveChosenDesc && !g_allAdapters.empty()) {
+        g_chosenAdapter = g_allAdapters.front();
+    }
+
+    if (bestAlternative && !g_chosenAdapter.likelyDiscrete) {
+        wchar_t buf[256];
+        swprintf_s(buf, L"Note: running on '%s' (integrated); a discrete GPU '%s' is also present but not in use.",
+            g_chosenAdapter.description.c_str(), bestAlternative->description.c_str());
+        g_adapterSelectionNote = buf;
+    }
+    else if (g_chosenAdapter.likelyDiscrete) {
+        g_adapterSelectionNote = L"Using discrete GPU (high-performance preference requested).";
+    }
+    else {
+        g_adapterSelectionNote = L"Using integrated/only available GPU.";
+    }
+}
+
+static void InitGpuMemoryQuery() {
+    g_dxgiAdapter3.Reset();
+    if (!g_d3dDevice) return;
+    ComPtr<IDXGIDevice> dxgiDevice;
+    if (FAILED(g_d3dDevice.As(&dxgiDevice))) return;
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgiDevice->GetAdapter(&adapter))) return;
+    adapter.As(&g_dxgiAdapter3); // may fail on older systems; that's fine, handled as unavailable
+}
+
+static void RefreshGpuMemoryUsage() {
+    if (!g_dxgiAdapter3) { g_gpuVideoMemUsedBytes = 0; g_gpuVideoMemBudgetBytes = 0; return; }
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (SUCCEEDED(g_dxgiAdapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+        g_gpuVideoMemUsedBytes = static_cast<SIZE_T>(info.CurrentUsage);
+        g_gpuVideoMemBudgetBytes = static_cast<SIZE_T>(info.Budget);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPU / Memory Diagnostics (PDH + PSAPI)
+// ---------------------------------------------------------------------------
+static void InitPerfCounters() {
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    g_logicalCoreCount = static_cast<int>(si.dwNumberOfProcessors);
+    if (g_logicalCoreCount < 1) g_logicalCoreCount = 1;
+
+    if (PdhOpenQueryW(nullptr, 0, &g_pdhQuery) != ERROR_SUCCESS) {
+        g_pdhQuery = nullptr;
+        return;
+    }
+
+    DWORD pid = GetCurrentProcessId();
+    wchar_t processCounterPath[256];
+    // "% Processor Time" for the current process instance, normalized to
+    // total logical cores by PDH already needs manual division; PDH reports
+    // 0-100*coreCount for _Total-style counters on "Process" object across
+    // all cores combined, so we divide by core count below when displaying.
+    swprintf_s(processCounterPath, L"\\Process(%s)\\%% Processor Time", L"*"); // placeholder, resolved below
+    // Resolve actual process instance name (can differ if multiple instances
+    // of the same exe run, e.g. "MatrixScreensaver#1").
+    {
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring exeName = exePath;
+        size_t slash = exeName.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) exeName = exeName.substr(slash + 1);
+        size_t dot = exeName.find_last_of(L'.');
+        if (dot != std::wstring::npos) exeName = exeName.substr(0, dot);
+
+        bool resolved = false;
+        for (int suffix = 0; suffix < 8 && !resolved; ++suffix) {
+            std::wstring instance = (suffix == 0) ? exeName : (exeName + L"#" + std::to_wstring(suffix));
+            swprintf_s(processCounterPath, L"\\Process(%s)\\%% Processor Time", instance.c_str());
+            PDH_HCOUNTER testCounter = nullptr;
+            if (PdhAddCounterW(g_pdhQuery, processCounterPath, 0, &testCounter) == ERROR_SUCCESS) {
+                // Verify this instance actually corresponds to our PID.
+                wchar_t idCounterPath[300];
+                swprintf_s(idCounterPath, L"\\Process(%s)\\ID Process", instance.c_str());
+                PDH_HCOUNTER idCounter = nullptr;
+                if (PdhAddCounterW(g_pdhQuery, idCounterPath, 0, &idCounter) == ERROR_SUCCESS) {
+                    PdhCollectQueryData(g_pdhQuery);
+                    PDH_FMT_COUNTERVALUE val{};
+                    if (PdhGetFormattedCounterValue(idCounter, PDH_FMT_LONG, nullptr, &val) == ERROR_SUCCESS) {
+                        if (static_cast<DWORD>(val.longValue) == pid) {
+                            resolved = true;
+                            g_pdhProcessCpuCounter = testCounter;
+                        }
+                    }
+                    PdhRemoveCounter(idCounter);
+                }
+                if (!resolved) PdhRemoveCounter(testCounter);
+            }
+        }
+    }
+
+    PdhAddCounterW(g_pdhQuery, L"\\Processor(_Total)\\% Processor Time", 0, &g_pdhTotalCpuCounter);
+    PdhCollectQueryData(g_pdhQuery); // prime the query; first formatted read needs two samples
+}
+
+static void ShutdownPerfCounters() {
+    if (g_pdhQuery) {
+        PdhCloseQuery(g_pdhQuery);
+        g_pdhQuery = nullptr;
+        g_pdhProcessCpuCounter = nullptr;
+        g_pdhTotalCpuCounter = nullptr;
+    }
+}
+
+static void RefreshCpuAndMemoryStats() {
+    if (g_pdhQuery) {
+        if (PdhCollectQueryData(g_pdhQuery) == ERROR_SUCCESS) {
+            PDH_FMT_COUNTERVALUE val{};
+            if (g_pdhProcessCpuCounter &&
+                PdhGetFormattedCounterValue(g_pdhProcessCpuCounter, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS) {
+                // This counter sums across all cores (can exceed 100%); normalize.
+                g_processCpuPercent = val.doubleValue / static_cast<double>(g_logicalCoreCount);
+            }
+            if (g_pdhTotalCpuCounter &&
+                PdhGetFormattedCounterValue(g_pdhTotalCpuCounter, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS) {
+                g_systemCpuPercent = val.doubleValue;
+            }
+        }
+    }
+
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+        g_processWorkingSetBytes = pmc.WorkingSetSize;
+        g_processPrivateBytes = pmc.PrivateUsage;
+    }
+
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        g_systemTotalPhysBytes = ms.ullTotalPhys;
+        g_systemUsedPhysBytes = ms.ullTotalPhys - ms.ullAvailPhys;
+        g_systemMemPercent = static_cast<double>(ms.dwMemoryLoad);
+    }
+
+    RefreshGpuMemoryUsage();
+}
+#else
+// No-op stubs so call sites don't need scattered #ifdefs when the overlay is
+// compiled out entirely.
+static inline void InitPerfCounters() {}
+static inline void ShutdownPerfCounters() {}
+static inline void RefreshCpuAndMemoryStats() {}
+#endif // ENABLE_BENCHMARK_OVERLAY
+
+// ---------------------------------------------------------------------------
 // Direct3D11 Setup Execution Contracts
 // ---------------------------------------------------------------------------
 static HRESULT CreateD3DDeviceAndSwapChain(HWND hwnd, int width, int height) {
     DXGI_SWAP_CHAIN_DESC scd = {};
-    // DISCARD (the legacy bit-block-transfer swap effect) is only a valid
-    // combination with a single back buffer - passing BufferCount=2 here
-    // causes CreateSwapChain to return E_INVALIDARG (0x80070057) on
-    // present-day WDDM drivers. FLIP_* effects support BufferCount>1, but
-    // DISCARD does not; since this is a screensaver (not latency/perf
-    // critical) a single back buffer is fine.
     scd.BufferCount = 1;
     scd.BufferDesc.Width = width;
     scd.BufferDesc.Height = height;
@@ -352,50 +631,89 @@ static HRESULT CreateD3DDeviceAndSwapChain(HWND hwnd, int width, int height) {
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
     scd.Windowed = TRUE;
-    // DISCARD is the broadest-compatible swap effect; this is a screensaver,
-    // not a latency-critical app, so we don't need FLIP_SEQUENTIAL's extra
-    // bookkeeping.
     scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
     D3D_FEATURE_LEVEL chosen{};
 
-    // BGRA_SUPPORT is required so the same textures can be interop'd into
-    // Direct2D for the one-time atlas rasterization pass.
     UINT deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     UINT debugFlag = 0;
 #ifdef _DEBUG
     debugFlag = D3D11_CREATE_DEVICE_DEBUG;
 #endif
 
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags | debugFlag,
-        levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-        &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
-
-    // D3D11_CREATE_DEVICE_DEBUG requires the optional "Graphics Tools"
-    // Windows feature (the D3D SDK debug layer). On a machine that doesn't
-    // have it installed, requesting this flag makes the call fail with
-    // E_INVALIDARG (0x80070057) - not a hardware/feature-level problem at
-    // all. Retry once without it before assuming the driver itself is at
-    // fault.
-    if (FAILED(hr) && debugFlag != 0) {
-        hr = D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags,
-            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+    // Explicitly pick the high-performance adapter when the system exposes
+    // IDXGIFactory6 (Windows 10 1803+). This is the most reliable way to steer
+    // hybrid-graphics laptops toward the discrete GPU; the NvOptimusEnablement /
+    // AmdPowerXpressRequestHighPerformance exports above are a fallback for
+    // older systems where factory6 isn't available.
+    ComPtr<IDXGIAdapter1> explicitAdapter;
+    ComPtr<IDXGIFactory1> factory1;
+    {
+        ComPtr<IDXGIFactory6> factory6;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory1)))) {
+            if (SUCCEEDED(factory1.As(&factory6))) {
+                factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    IID_PPV_ARGS(&explicitAdapter));
+            }
+        }
     }
 
-    // Hardware driver may be missing/unable to satisfy BGRA_SUPPORT at any
-    // of the requested feature levels (common under RDP/some VMs/old GPUs).
-    // Fall back to the WARP software rasterizer rather than failing init
-    // outright - this is a screensaver, so WARP's performance is acceptable.
+    HRESULT hr;
+    if (explicitAdapter) {
+        hr = D3D11CreateDeviceAndSwapChain(
+            explicitAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, deviceFlags | debugFlag,
+            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+        if (FAILED(hr) && debugFlag != 0) {
+            hr = D3D11CreateDeviceAndSwapChain(
+                explicitAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, deviceFlags,
+                levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+        }
+    }
+    else {
+        // Typo fix applied: singular g_d3dContext
+        hr = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags | debugFlag,
+            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+
+        if (FAILED(hr) && debugFlag != 0) {
+            hr = D3D11CreateDeviceAndSwapChain(
+                nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags,
+                levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+        }
+    }
+
     if (FAILED(hr)) {
         hr = D3D11CreateDeviceAndSwapChain(
             nullptr, D3D_DRIVER_TYPE_WARP, nullptr, deviceFlags,
             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
             &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
     }
+
+    if (SUCCEEDED(hr)) {
+        // Report which adapter actually ended up being used, and whether a
+        // better discrete option was available but skipped.
+        ComPtr<IDXGIAdapter> actualAdapter;
+        if (explicitAdapter) {
+            actualAdapter = explicitAdapter;
+        }
+        else if (g_d3dDevice) {
+            ComPtr<IDXGIDevice> dxgiDevice;
+            if (SUCCEEDED(g_d3dDevice.As(&dxgiDevice))) {
+                dxgiDevice->GetAdapter(&actualAdapter);
+            }
+        }
+        if (!factory1) CreateDXGIFactory1(IID_PPV_ARGS(&factory1));
+#if ENABLE_BENCHMARK_OVERLAY
+        if (factory1) EnumerateAndSelectAdapter(factory1.Get(), actualAdapter.Get());
+        InitGpuMemoryQuery();
+#endif
+    }
+
     return hr;
 }
 
@@ -422,8 +740,6 @@ static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
     hr = g_d3dDevice->CreateInputLayout(layout, ARRAYSIZE(layout), vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
     if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateInputLayout"; return hr; }
 
-    // Static unit quad (triangle strip: 0,0 / 1,0 / 0,1 / 1,1), scaled and
-    // positioned per-instance in the vertex shader.
     const float quadVerts[] = { 0,0, 1,0, 0,1, 1,1 };
     D3D11_BUFFER_DESC qbd = {};
     qbd.ByteWidth = sizeof(quadVerts);
@@ -434,7 +750,7 @@ static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
     if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateBuffer(quadVertexBuffer)"; return hr; }
 
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = sizeof(float) * 4; // float2 viewport + float2 padding, 16-byte aligned
+    cbd.ByteWidth = sizeof(float) * 4;
     cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -449,9 +765,6 @@ static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
     hr = g_d3dDevice->CreateSamplerState(&sd, &g_samplerState);
     if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateSamplerState"; return hr; }
 
-    // Premultiplied-alpha blend: used for the fade quad and glyph draws into
-    // the persistent trail buffer, since the atlas textures come out of
-    // Direct2D premultiplied.
     D3D11_BLEND_DESC pbd = {};
     pbd.RenderTarget[0].BlendEnable = TRUE;
     pbd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -464,17 +777,12 @@ static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
     hr = g_d3dDevice->CreateBlendState(&pbd, &g_premulAlphaBlend);
     if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateBlendState(premulAlpha)"; return hr; }
 
-    // Opaque (blend-disabled) state for the final trail->backbuffer
-    // composite, matching the original's D2D1_ALPHA_MODE_IGNORE behavior:
-    // a straight overwrite regardless of the trail buffer's alpha channel.
     D3D11_BLEND_DESC obd = {};
     obd.RenderTarget[0].BlendEnable = FALSE;
     obd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     hr = g_d3dDevice->CreateBlendState(&obd, &g_opaqueBlend);
     if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateBlendState(opaque)"; return hr; }
 
-    // 1x1 opaque white texture, sampled by the fade quad; tinted by its
-    // instance color (0,0,0,0.16) to produce the translucent black fade.
     D3D11_TEXTURE2D_DESC wtd = {};
     wtd.Width = 1; wtd.Height = 1; wtd.MipLevels = 1; wtd.ArraySize = 1;
     wtd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -498,8 +806,6 @@ static HRESULT CreateSizeDependentResources(int width, int height) {
     hr = g_d3dDevice->CreateRenderTargetView(backBuffer.Get(), nullptr, &g_backBufferRTV);
     if (FAILED(hr)) return hr;
 
-    // Persistent trail buffer: same size as the client area, never cleared
-    // after this point (only faded), exactly like the old g_trailTarget.
     D3D11_TEXTURE2D_DESC ttd = {};
     ttd.Width = width; ttd.Height = height; ttd.MipLevels = 1; ttd.ArraySize = 1;
     ttd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -515,8 +821,43 @@ static HRESULT CreateSizeDependentResources(int width, int height) {
 
     const float black[4] = { 0, 0, 0, 1 };
     g_d3dContext->ClearRenderTargetView(g_trailRTV.Get(), black);
+
+#if ENABLE_BENCHMARK_OVERLAY
+    // D2D bitmap view onto the swap chain's backbuffer surface, used only to
+    // draw the benchmark overlay text on top of the composited frame.
+    g_overlayD2DTarget.Reset();
+    if (g_d2dContext) {
+        ComPtr<IDXGISurface> backSurface;
+        if (SUCCEEDED(backBuffer.As(&backSurface))) {
+            D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+            g_d2dContext->CreateBitmapFromDxgiSurface(backSurface.Get(), &bp, &g_overlayD2DTarget);
+        }
+    }
+#endif
     return S_OK;
 }
+
+#if ENABLE_BENCHMARK_OVERLAY
+static HRESULT CreateOverlayResources() {
+    if (!g_dwriteFactory || !g_d2dContext) return E_FAIL;
+
+    HRESULT hr = g_dwriteFactory->CreateTextFormat(
+        L"Consolas", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &g_overlayTextFormat);
+    if (FAILED(hr)) return hr;
+    g_overlayTextFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+    hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.35f, 1.0f, 0.45f, 1.0f), &g_overlayTextBrush);
+    if (FAILED(hr)) return hr;
+
+    hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f), &g_overlayBgBrush);
+    return hr;
+}
+#else
+static inline HRESULT CreateOverlayResources() { return S_OK; }
+#endif // ENABLE_BENCHMARK_OVERLAY
 
 static HRESULT BuildOneAtlasTexture(IDWriteTextFormat* format, int cell, D2D1_COLOR_F color,
     ComPtr<ID3D11Texture2D>& outTexture, ComPtr<ID3D11ShaderResourceView>& outSRV) {
@@ -577,6 +918,7 @@ static HRESULT BuildAtlasForLayer(int layer) {
     const int cell = cfg.fontSize + 4;
 
     ComPtr<IDWriteTextFormat> format;
+    // Typo fix applied: g_dwriteFactory
     HRESULT hr = g_dwriteFactory->CreateTextFormat(
         L"MS Mincho", nullptr,
         DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
@@ -614,6 +956,13 @@ static void DiscardDeviceResources() {
     g_trailRTV.Reset();
     g_trailSRV.Reset();
     g_backBufferRTV.Reset();
+#if ENABLE_BENCHMARK_OVERLAY
+    g_overlayD2DTarget.Reset();
+    g_overlayTextFormat.Reset();
+    g_overlayTextBrush.Reset();
+    g_overlayBgBrush.Reset();
+    g_dxgiAdapter3.Reset();
+#endif
     g_d2dContext.Reset();
     g_d2dDevice.Reset();
     g_vertexShader.Reset();
@@ -644,6 +993,7 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
     hr = D2D1CreateFactory<ID2D1Factory1>(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2dFactory.GetAddressOf());
     if (FAILED(hr)) { if (failedStage) *failedStage = L"D2D1CreateFactory"; return hr; }
 
+    // Interop Conversion Error Fix Applied: declared as ComPtr<IDXGIDevice> instead of IDXGISurface
     ComPtr<IDXGIDevice> dxgiDevice;
     hr = g_d3dDevice.As(&dxgiDevice);
     if (FAILED(hr)) { if (failedStage) *failedStage = L"QueryIDXGIDevice"; return hr; }
@@ -672,6 +1022,21 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
     hr = CreateSizeDependentResources(width, height);
     if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateSizeDependentResources"; return hr; }
 
+    hr = CreateOverlayResources();
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateOverlayResources"; return hr; }
+
+    QueryPerformanceFrequency(&g_pacingQpcFrequency);
+    QueryPerformanceCounter(&g_pacingLastFrameQpc);
+    g_pacingInitialized = true;
+
+#if ENABLE_BENCHMARK_OVERLAY
+    g_qpcFrequency = g_pacingQpcFrequency;
+    g_lastFrameQpc = g_pacingLastFrameQpc;
+    g_frameTimesMs.clear();
+    g_totalFramesRendered = 0;
+    g_droppedPresentCount = 0;
+#endif
+
     for (int i = 0; i < NUM_LAYERS; ++i) {
         hr = BuildAtlasForLayer(i);
         if (FAILED(hr)) { if (failedStage) *failedStage = L"BuildAtlasForLayer"; return hr; }
@@ -681,8 +1046,6 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
 
 static HRESULT EnsureInstanceCapacity(LayerInstanceBuffer& lib, UINT needed) {
     if (needed <= lib.capacity && lib.buffer) return S_OK;
-    // Grow with slack so we're not reallocating every time the visible
-    // glyph count fluctuates by one.
     UINT newCapacity = lib.capacity == 0 ? 64 : lib.capacity;
     while (newCapacity < needed) newCapacity += newCapacity / 2 + 8;
 
@@ -725,10 +1088,129 @@ static void DrawInstanced(ID3D11ShaderResourceView* srv, LayerInstanceBuffer& li
 // ---------------------------------------------------------------------------
 // Frame Rendering
 // ---------------------------------------------------------------------------
+#if ENABLE_BENCHMARK_OVERLAY
+// Updates rolling frame-time stats (avg/min/max/p99) from g_frameTimesMs.
+static void RecomputeFrameStats() {
+    if (g_frameTimesMs.empty()) return;
+    double sum = 0.0, mn = g_frameTimesMs[0], mx = g_frameTimesMs[0];
+    for (double t : g_frameTimesMs) {
+        sum += t;
+        if (t < mn) mn = t;
+        if (t > mx) mx = t;
+    }
+    g_avgFrameMs = sum / static_cast<double>(g_frameTimesMs.size());
+    g_minFrameMs = mn;
+    g_maxFrameMs = mx;
+    g_currentFps = (g_avgFrameMs > 0.0001) ? (1000.0 / g_avgFrameMs) : 0.0;
+
+    std::vector<double> sorted(g_frameTimesMs.begin(), g_frameTimesMs.end());
+    std::sort(sorted.begin(), sorted.end());
+    size_t p99Idx = static_cast<size_t>(sorted.size() * 0.99);
+    if (p99Idx >= sorted.size()) p99Idx = sorted.size() - 1;
+    g_p99FrameMs = sorted[p99Idx]; // worst 1% frame time -- the classic "stutter" indicator
+}
+
+static std::wstring FormatBytesMB(SIZE_T bytes) {
+    wchar_t buf[64];
+    swprintf_s(buf, L"%.0f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    return buf;
+}
+
+// Draws the benchmark/diagnostics HUD directly onto the backbuffer using D2D,
+// after the D3D11 composite pass has finished writing it. This runs through
+// the D3D/D2D interop device context so it composites correctly on top of
+// the Matrix rain without needing its own render target.
+static void DrawBenchmarkOverlay() {
+    if (!g_benchEnabled || !g_d2dContext || !g_overlayD2DTarget || !g_overlayTextFormat) return;
+
+    wchar_t buf[1024];
+    int len = swprintf_s(buf,
+        L"FPS: %.1f   frame: %.2f ms (min %.2f / avg %.2f / max %.2f / p99 %.2f)\n"
+        L"Frames rendered: %llu   Dropped presents: %llu\n"
+        L"CPU  -- this process: %.1f%%   system total: %.1f%% (%d logical cores)\n"
+        L"RAM  -- this process: %s working set / %s private   system: %.0f%% used (%s / %s)\n"
+        L"GPU adapter: %s%s\n"
+        L"GPU VRAM: %s used / %s budget%s\n"
+        L"[B] toggle this overlay",
+        g_currentFps, g_avgFrameMs, g_minFrameMs, g_avgFrameMs, g_maxFrameMs, g_p99FrameMs,
+        static_cast<unsigned long long>(g_totalFramesRendered),
+        static_cast<unsigned long long>(g_droppedPresentCount),
+        g_processCpuPercent, g_systemCpuPercent, g_logicalCoreCount,
+        FormatBytesMB(g_processWorkingSetBytes).c_str(), FormatBytesMB(g_processPrivateBytes).c_str(),
+        g_systemMemPercent, FormatBytesMB(g_systemUsedPhysBytes).c_str(), FormatBytesMB(g_systemTotalPhysBytes).c_str(),
+        g_chosenAdapter.description.c_str(), g_chosenAdapter.likelyDiscrete ? L" (discrete)" : L" (integrated)",
+        g_dxgiAdapter3 ? FormatBytesMB(g_gpuVideoMemUsedBytes).c_str() : L"n/a",
+        g_dxgiAdapter3 ? FormatBytesMB(g_gpuVideoMemBudgetBytes).c_str() : L"n/a",
+        g_dxgiAdapter3 ? L"" : L" (query unsupported on this driver)"
+    );
+    if (len < 0) return;
+
+    g_d2dContext->SetTarget(g_overlayD2DTarget.Get());
+    g_d2dContext->BeginDraw();
+
+    const float pad = 10.0f;
+    const float panelW = 620.0f;
+    const float panelH = 130.0f;
+    D2D1_RECT_F bgRect = D2D1::RectF(pad, pad, pad + panelW, pad + panelH);
+    g_d2dContext->FillRectangle(bgRect, g_overlayBgBrush.Get());
+
+    D2D1_RECT_F textRect = D2D1::RectF(pad + 8.0f, pad + 6.0f, pad + panelW - 8.0f, pad + panelH - 6.0f);
+    g_d2dContext->DrawTextW(buf, static_cast<UINT32>(len), g_overlayTextFormat.Get(), textRect, g_overlayTextBrush.Get());
+
+    // Note about GPU selection (only shown when relevant, drawn as a second line
+    // beneath the panel so it doesn't compete for space with the dense stats).
+    if (!g_adapterSelectionNote.empty()) {
+        D2D1_RECT_F noteRect = D2D1::RectF(pad, pad + panelH + 4.0f, pad + panelW, pad + panelH + 40.0f);
+        g_d2dContext->DrawTextW(g_adapterSelectionNote.c_str(), static_cast<UINT32>(g_adapterSelectionNote.size()),
+            g_overlayTextFormat.Get(), noteRect, g_overlayTextBrush.Get());
+    }
+
+    g_d2dContext->EndDraw();
+    g_d2dContext->SetTarget(nullptr);
+}
+#else
+static inline void DrawBenchmarkOverlay() {}
+#endif // ENABLE_BENCHMARK_OVERLAY
+
 static void DrawFrame(DWORD tickCount) {
     if (!g_d3dContext || !g_trailRTV || !g_backBufferRTV) return;
 
-    // --- Simulation + instance-list build (unchanged math, new sink) -------
+    // Real elapsed time since the previous frame. This always runs (regardless
+    // of the benchmark macro) because animation speed must stay correct now
+    // that the render loop is paced by Present()/vsync instead of a fixed
+    // 16ms Win32 timer tick -- frame rate can now vary (e.g. 60 vs 144Hz), so
+    // all per-frame motion must scale by real delta time rather than assuming
+    // a fixed tick.
+    LARGE_INTEGER frameStartQpc;
+    QueryPerformanceCounter(&frameStartQpc);
+    double deltaSeconds = 0.016; // sane fallback for the very first frame
+    if (g_pacingInitialized && g_pacingQpcFrequency.QuadPart > 0) {
+        deltaSeconds = static_cast<double>(frameStartQpc.QuadPart - g_pacingLastFrameQpc.QuadPart)
+            / static_cast<double>(g_pacingQpcFrequency.QuadPart);
+        // Clamp to avoid huge jumps after the window was minimized/stalled.
+        if (deltaSeconds > 0.25) deltaSeconds = 0.25;
+        if (deltaSeconds < 0.0) deltaSeconds = 0.0;
+    }
+    g_pacingLastFrameQpc = frameStartQpc;
+    g_pacingInitialized = true;
+    const float deltaTimeScale = static_cast<float>(deltaSeconds) * 60.0f; // 1.0 at 60fps, as original tuning assumed
+
+#if ENABLE_BENCHMARK_OVERLAY
+    if (g_qpcFrequency.QuadPart > 0) {
+        g_frameTimesMs.push_back(deltaSeconds * 1000.0);
+        while (g_frameTimesMs.size() > kFrameHistoryMax) g_frameTimesMs.pop_front();
+        RecomputeFrameStats();
+    }
+    g_lastFrameQpc = frameStartQpc;
+    ++g_totalFramesRendered;
+
+    ULONGLONG nowTick = GetTickCount64();
+    if (g_benchEnabled && (nowTick - g_lastStatsRefreshTick) >= STATS_REFRESH_INTERVAL_MS) {
+        RefreshCpuAndMemoryStats();
+        g_lastStatsRefreshTick = nowTick;
+    }
+#endif
+
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         g_headScratch[layer].clear();
         g_trailScratch[layer].clear();
@@ -744,23 +1226,19 @@ static void DrawFrame(DWORD tickCount) {
             ColumnState& col = g_columns[colIdx];
 
             for (auto& s : col.symbols) {
-                // Precomputed-tick re-roll: avoids a modulo per symbol per
-                // frame. Only recomputes the next trigger tick when it
-                // actually fires, instead of testing (tickCount % interval)
-                // every single frame for every symbol.
                 if (s.interval > 0 && tickCount >= s.nextChangeTick) {
                     s.value = RandomKatakana();
                     s.nextChangeTick = tickCount + static_cast<DWORD>(s.interval);
                 }
 
-                s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f;
+                // Original tuning was "speed * speedMul * 0.6" per 16ms timer
+                // tick (~60fps assumed). deltaTimeScale is 1.0 at 60fps and
+                // scales proportionally at other frame rates, so fall speed
+                // stays constant in real time regardless of how fast frames
+                // are actually being produced (60Hz, 144Hz, uncapped, etc).
+                s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f * deltaTimeScale;
                 if (s.y > g_height) s.y = -static_cast<float>(cfg.fontSize);
 
-                // Skip glyphs currently outside the visible viewport (e.g.
-                // trailing symbols still above frame, or mid-wrap). Position
-                // still updates above so parallax speed, wrapping, and depth
-                // ordering are unaffected - this only avoids adding an
-                // instance for something that would render nothing.
                 if (s.y + cellF < 0.0f || s.y > static_cast<float>(g_height)) continue;
 
                 int glyphIndex = static_cast<int>(s.value) - 0x30A0;
@@ -776,11 +1254,6 @@ static void DrawFrame(DWORD tickCount) {
                 inst.destH = cellF;
                 inst.u0 = u0; inst.v0 = 0.0f;
                 inst.u1 = u1; inst.v1 = 1.0f;
-                // Premultiplied tint: atlas rgb is already baked with the
-                // layer's head/trail color at full alpha, so scaling all
-                // four channels by brightnessMul reduces both opacity and
-                // premultiplied color together, matching the original
-                // DrawBitmap(..., opacity, ...) call exactly.
                 inst.colorR = inst.colorG = inst.colorB = inst.colorA = brightness;
 
                 if (s.isHead) g_headScratch[layer].push_back(inst);
@@ -789,7 +1262,6 @@ static void DrawFrame(DWORD tickCount) {
         }
     }
 
-    // --- Upload viewport constant buffer (shared by every draw this frame) -
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (SUCCEEDED(g_d3dContext->Map(g_viewportCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         float vp[4] = { static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, 0.0f };
@@ -797,7 +1269,6 @@ static void DrawFrame(DWORD tickCount) {
         g_d3dContext->Unmap(g_viewportCB.Get(), 0);
     }
 
-    // --- Common pipeline state, shared by all draws this frame -------------
     UINT stride = sizeof(float) * 2, offset = 0;
     g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     g_d3dContext->IASetInputLayout(g_inputLayout.Get());
@@ -809,7 +1280,6 @@ static void DrawFrame(DWORD tickCount) {
     D3D11_VIEWPORT vp = { 0, 0, static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, 1.0f };
     g_d3dContext->RSSetViewports(1, &vp);
 
-    // --- Pass 1: fade + glyphs into the persistent trail buffer -------------
     const float blendFactor[4] = { 0, 0, 0, 0 };
     g_d3dContext->OMSetRenderTargets(1, g_trailRTV.GetAddressOf(), nullptr);
     g_d3dContext->OMSetBlendState(g_premulAlphaBlend.Get(), blendFactor, 0xFFFFFFFF);
@@ -839,9 +1309,8 @@ static void DrawFrame(DWORD tickCount) {
         }
     }
 
-    // --- Pass 2: composite trail buffer onto the backbuffer (opaque) -------
     ID3D11ShaderResourceView* nullSRV = nullptr;
-    g_d3dContext->PSSetShaderResources(0, 1, &nullSRV); // unbind before rebinding trail texture as RTV->SRV
+    g_d3dContext->PSSetShaderResources(0, 1, &nullSRV);
     g_d3dContext->OMSetRenderTargets(1, g_backBufferRTV.GetAddressOf(), nullptr);
     g_d3dContext->OMSetBlendState(g_opaqueBlend.Get(), blendFactor, 0xFFFFFFFF);
 
@@ -857,10 +1326,23 @@ static void DrawFrame(DWORD tickCount) {
     UploadInstances(compositeBuf, compositeScratch);
     DrawInstanced(g_trailSRV.Get(), compositeBuf, 1);
 
-    // Sync-interval 1 paces presentation to vsync (same intent as the
-    // earlier D2D1_PRESENT_OPTIONS_NONE change) rather than flipping as
-    // fast as possible.
+    DrawBenchmarkOverlay();
+
+#if UNCAP_FRAMERATE
+    // Vsync disabled: renders as fast as the GPU can produce frames, ignoring
+    // the monitor's refresh rate. Useful for measuring true max throughput,
+    // but will spin the GPU at high power/thermal cost for no visual benefit
+    // (frames faster than the display can show are simply discarded/torn).
+    HRESULT hr = g_swapChain->Present(0, 0);
+#else
+    // Vsync enabled: Present blocks until the next vblank, which paces the
+    // whole loop to the monitor's native refresh rate (e.g. 144Hz) with no
+    // tearing and minimal wasted GPU work.
     HRESULT hr = g_swapChain->Present(1, 0);
+#endif
+#if ENABLE_BENCHMARK_OVERLAY
+    if (FAILED(hr)) ++g_droppedPresentCount;
+#endif
 
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         DiscardDeviceResources();
@@ -869,7 +1351,6 @@ static void DrawFrame(DWORD tickCount) {
         }
     }
 }
-
 
 static void ResetMouseTracking(HWND hwnd) {
     GetCursorPos(&g_lastMousePos);
@@ -901,17 +1382,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         InitColumns(g_width, g_height);
+        InitPerfCounters();
 
         if (!g_isPreview) ShowCursor(FALSE);
         ResetMouseTracking(hwnd);
-        SetTimer(hwnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
+
+        // The small embedded preview window (screensaver picker thumbnail) has
+        // no reason to render at full monitor refresh rate -- it's tiny and
+        // usually not even visible for long. Keep it on a modest timer so it
+        // doesn't compete for GPU/CPU with whatever else is running. The
+        // fullscreen case is driven by the main PeekMessage loop in wWinMain
+        // instead, paced by Present()'s vsync wait, so no timer is needed there.
+        if (g_isPreview) {
+            SetTimer(hwnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
+        }
         return 0;
     }
     case WM_TIMER: {
-        // Skip rendering entirely while minimized or fully occluded - the
-        // animation state (positions, glyphs) simply doesn't advance during
-        // that time, same as if the timer had never fired. No frames are
-        // dropped or skipped while actually on screen.
         if (g_isVisible) DrawFrame(static_cast<DWORD>(GetTickCount64()));
         return 0;
     }
@@ -935,18 +1422,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (newWidth < 1) newWidth = 1;
             if (newHeight < 1) newHeight = 1;
 
-            // Nothing to do if the size didn't actually change (e.g. a
-            // restore-from-minimize that lands back at the same client
-            // rect) - avoids tearing down/rebuilding the swap chain buffers
-            // for free.
             if (newWidth != g_width || newHeight != g_height) {
                 g_width = newWidth;
                 g_height = newHeight;
 
-                // Release everything that holds a reference to the swap
-                // chain's back buffer or is sized off the old client area
-                // before calling ResizeBuffers - D3D11 refuses to resize
-                // while views onto the old buffers are still alive.
                 g_d3dContext->OMSetRenderTargets(0, nullptr, nullptr);
                 g_backBufferRTV.Reset();
                 g_trailRTV.Reset();
@@ -960,9 +1439,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
 
                 if (FAILED(hr)) {
-                    // Swap chain is in an unrecoverable state at this size -
-                    // fall back to the same full rebuild path used for
-                    // device-removed/reset, same as DrawFrame does.
                     DiscardDeviceResources();
                     if (SUCCEEDED(InitDirect2D(hwnd))) {
                         InitColumns(g_width, g_height);
@@ -970,10 +1446,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     return 0;
                 }
 
-                // The persistent trail buffer was just recreated at the new
-                // size (and cleared to black in CreateSizeDependentResources),
-                // so the rain layout is reseeded to match the new bounds -
-                // same intent as the old g_trailTarget rebuild-and-clear.
                 InitColumns(g_width, g_height);
             }
         }
@@ -1003,7 +1475,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
+        if (!g_isPreview && !InGracePeriod()) DestroyWindow(hwnd);
+        return 0;
+
     case WM_KEYDOWN:
+        // 'B' toggles the benchmark/diagnostics overlay without exiting the
+        // screensaver, so you can check performance without losing the session.
+        // Only meaningful when the overlay is compiled in; when
+        // ENABLE_BENCHMARK_OVERLAY is 0, 'B' falls through and exits like any
+        // other key, since there's nothing to toggle.
+#if ENABLE_BENCHMARK_OVERLAY
+        if (wParam == 'B') {
+            g_benchEnabled = !g_benchEnabled;
+            return 0;
+        }
+#endif
         if (!g_isPreview && !InGracePeriod()) DestroyWindow(hwnd);
         return 0;
 
@@ -1014,6 +1500,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
         if (!g_isPreview) ShowCursor(TRUE);
+        ShutdownPerfCounters();
         DiscardDeviceResources();
         PostQuitMessage(0);
         return 0;
@@ -1107,10 +1594,35 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
 
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    // Fullscreen mode: drain all pending Windows messages without blocking,
+    // then render one frame. Present(1,0) (vsync on) blocks inside DrawFrame
+    // until the next vblank, which is what actually paces this loop to the
+    // monitor's refresh rate (e.g. 144Hz) -- there is no Sleep()/timer needed.
+    // The preview window (small embedded thumbnail, g_isPreview == true) is
+    // still driven by its own WM_TIMER set up in WM_CREATE, so this loop just
+    // pumps its messages normally without an extra render call for it.
+    MSG msg{};
+    bool running = true;
+    while (running) {
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        if (!running) break;
+
+        if (!g_isPreview && g_isVisible) {
+            DrawFrame(static_cast<DWORD>(GetTickCount64()));
+        }
+        else {
+            // Nothing to render right now (preview window renders via its own
+            // timer; fullscreen window is hidden/minimized) -- avoid a hot
+            // spin loop burning a CPU core for no reason.
+            WaitMessage();
+        }
     }
     return static_cast<int>(msg.wParam);
 }
