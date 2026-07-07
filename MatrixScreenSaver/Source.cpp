@@ -39,6 +39,22 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Pdh.lib")
 
+// ---------------------------------------------------------------------------
+// Build-time switches
+// ---------------------------------------------------------------------------
+// Set to 0 to fully compile out the benchmark/diagnostics overlay and all its
+// bookkeeping (PDH queries, DXGI memory queries, frame-time history, HUD
+// drawing). Set to 1 to include it (still toggleable at runtime with the 'B'
+// key when enabled here).
+#define ENABLE_BENCHMARK_OVERLAY 0
+
+// Set to 1 to disable vsync (Present(0,0)) and let the render loop run as fast
+// as the GPU can produce frames, uncapped by the monitor's refresh rate. This
+// is mainly useful for measuring true max GPU throughput. Leave at 0 for
+// normal use: Present(1,0) paces the loop to the monitor's native refresh
+// rate (e.g. 144Hz on a 144Hz display), which is smooth and power-efficient.
+#define UNCAP_FRAMERATE 0
+
 using Microsoft::WRL::ComPtr;
 
 // ---------------------------------------------------------------------------
@@ -167,6 +183,7 @@ static bool  g_isVisible = true;
 // ---------------------------------------------------------------------------
 // Benchmark / Diagnostics Overlay
 // ---------------------------------------------------------------------------
+#if ENABLE_BENCHMARK_OVERLAY
 // Toggle overlay with the "B" key (does not exit the screensaver, since normal
 // key input already exits; the toggle is handled specially in WndProc before
 // the exit-on-keypress logic runs).
@@ -229,6 +246,14 @@ static ComPtr<IDWriteTextFormat>    g_overlayTextFormat;
 static ComPtr<ID2D1SolidColorBrush> g_overlayTextBrush;
 static ComPtr<ID2D1SolidColorBrush> g_overlayBgBrush;
 static ComPtr<ID2D1Bitmap1>         g_overlayD2DTarget; // D2D view of the backbuffer, for direct overlay draw
+#endif // ENABLE_BENCHMARK_OVERLAY
+
+// Real-time frame pacing (always needed, independent of the benchmark overlay,
+// since DrawFrame's animation now advances by measured elapsed time rather
+// than a fixed per-tick assumption).
+static LARGE_INTEGER g_pacingQpcFrequency{};
+static LARGE_INTEGER g_pacingLastFrameQpc{};
+static bool          g_pacingInitialized = false;
 
 // ---------------------------------------------------------------------------
 // Matrix Cascade Random String Generation Engine
@@ -373,6 +398,7 @@ static HRESULT CompileShader(const char* entryPoint, const char* target, ComPtr<
 // ---------------------------------------------------------------------------
 // GPU Adapter Enumeration & Selection Reporting
 // ---------------------------------------------------------------------------
+#if ENABLE_BENCHMARK_OVERLAY
 // Well-known PCI vendor IDs used to guess discrete vs integrated when the
 // description string alone isn't conclusive.
 static bool VendorIsDiscreteLikely(UINT vendorId, const std::wstring& desc) {
@@ -581,6 +607,13 @@ static void RefreshCpuAndMemoryStats() {
 
     RefreshGpuMemoryUsage();
 }
+#else
+// No-op stubs so call sites don't need scattered #ifdefs when the overlay is
+// compiled out entirely.
+static inline void InitPerfCounters() {}
+static inline void ShutdownPerfCounters() {}
+static inline void RefreshCpuAndMemoryStats() {}
+#endif // ENABLE_BENCHMARK_OVERLAY
 
 // ---------------------------------------------------------------------------
 // Direct3D11 Setup Execution Contracts
@@ -675,8 +708,10 @@ static HRESULT CreateD3DDeviceAndSwapChain(HWND hwnd, int width, int height) {
             }
         }
         if (!factory1) CreateDXGIFactory1(IID_PPV_ARGS(&factory1));
+#if ENABLE_BENCHMARK_OVERLAY
         if (factory1) EnumerateAndSelectAdapter(factory1.Get(), actualAdapter.Get());
         InitGpuMemoryQuery();
+#endif
     }
 
     return hr;
@@ -787,6 +822,7 @@ static HRESULT CreateSizeDependentResources(int width, int height) {
     const float black[4] = { 0, 0, 0, 1 };
     g_d3dContext->ClearRenderTargetView(g_trailRTV.Get(), black);
 
+#if ENABLE_BENCHMARK_OVERLAY
     // D2D bitmap view onto the swap chain's backbuffer surface, used only to
     // draw the benchmark overlay text on top of the composited frame.
     g_overlayD2DTarget.Reset();
@@ -799,9 +835,11 @@ static HRESULT CreateSizeDependentResources(int width, int height) {
             g_d2dContext->CreateBitmapFromDxgiSurface(backSurface.Get(), &bp, &g_overlayD2DTarget);
         }
     }
+#endif
     return S_OK;
 }
 
+#if ENABLE_BENCHMARK_OVERLAY
 static HRESULT CreateOverlayResources() {
     if (!g_dwriteFactory || !g_d2dContext) return E_FAIL;
 
@@ -817,6 +855,9 @@ static HRESULT CreateOverlayResources() {
     hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f), &g_overlayBgBrush);
     return hr;
 }
+#else
+static inline HRESULT CreateOverlayResources() { return S_OK; }
+#endif // ENABLE_BENCHMARK_OVERLAY
 
 static HRESULT BuildOneAtlasTexture(IDWriteTextFormat* format, int cell, D2D1_COLOR_F color,
     ComPtr<ID3D11Texture2D>& outTexture, ComPtr<ID3D11ShaderResourceView>& outSRV) {
@@ -915,11 +956,13 @@ static void DiscardDeviceResources() {
     g_trailRTV.Reset();
     g_trailSRV.Reset();
     g_backBufferRTV.Reset();
+#if ENABLE_BENCHMARK_OVERLAY
     g_overlayD2DTarget.Reset();
     g_overlayTextFormat.Reset();
     g_overlayTextBrush.Reset();
     g_overlayBgBrush.Reset();
     g_dxgiAdapter3.Reset();
+#endif
     g_d2dContext.Reset();
     g_d2dDevice.Reset();
     g_vertexShader.Reset();
@@ -982,11 +1025,17 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
     hr = CreateOverlayResources();
     if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateOverlayResources"; return hr; }
 
-    QueryPerformanceFrequency(&g_qpcFrequency);
-    QueryPerformanceCounter(&g_lastFrameQpc);
+    QueryPerformanceFrequency(&g_pacingQpcFrequency);
+    QueryPerformanceCounter(&g_pacingLastFrameQpc);
+    g_pacingInitialized = true;
+
+#if ENABLE_BENCHMARK_OVERLAY
+    g_qpcFrequency = g_pacingQpcFrequency;
+    g_lastFrameQpc = g_pacingLastFrameQpc;
     g_frameTimesMs.clear();
     g_totalFramesRendered = 0;
     g_droppedPresentCount = 0;
+#endif
 
     for (int i = 0; i < NUM_LAYERS; ++i) {
         hr = BuildAtlasForLayer(i);
@@ -1039,6 +1088,7 @@ static void DrawInstanced(ID3D11ShaderResourceView* srv, LayerInstanceBuffer& li
 // ---------------------------------------------------------------------------
 // Frame Rendering
 // ---------------------------------------------------------------------------
+#if ENABLE_BENCHMARK_OVERLAY
 // Updates rolling frame-time stats (avg/min/max/p99) from g_frameTimesMs.
 static void RecomputeFrameStats() {
     if (g_frameTimesMs.empty()) return;
@@ -1118,16 +1168,36 @@ static void DrawBenchmarkOverlay() {
     g_d2dContext->EndDraw();
     g_d2dContext->SetTarget(nullptr);
 }
+#else
+static inline void DrawBenchmarkOverlay() {}
+#endif // ENABLE_BENCHMARK_OVERLAY
 
 static void DrawFrame(DWORD tickCount) {
     if (!g_d3dContext || !g_trailRTV || !g_backBufferRTV) return;
 
+    // Real elapsed time since the previous frame. This always runs (regardless
+    // of the benchmark macro) because animation speed must stay correct now
+    // that the render loop is paced by Present()/vsync instead of a fixed
+    // 16ms Win32 timer tick -- frame rate can now vary (e.g. 60 vs 144Hz), so
+    // all per-frame motion must scale by real delta time rather than assuming
+    // a fixed tick.
     LARGE_INTEGER frameStartQpc;
     QueryPerformanceCounter(&frameStartQpc);
+    double deltaSeconds = 0.016; // sane fallback for the very first frame
+    if (g_pacingInitialized && g_pacingQpcFrequency.QuadPart > 0) {
+        deltaSeconds = static_cast<double>(frameStartQpc.QuadPart - g_pacingLastFrameQpc.QuadPart)
+            / static_cast<double>(g_pacingQpcFrequency.QuadPart);
+        // Clamp to avoid huge jumps after the window was minimized/stalled.
+        if (deltaSeconds > 0.25) deltaSeconds = 0.25;
+        if (deltaSeconds < 0.0) deltaSeconds = 0.0;
+    }
+    g_pacingLastFrameQpc = frameStartQpc;
+    g_pacingInitialized = true;
+    const float deltaTimeScale = static_cast<float>(deltaSeconds) * 60.0f; // 1.0 at 60fps, as original tuning assumed
+
+#if ENABLE_BENCHMARK_OVERLAY
     if (g_qpcFrequency.QuadPart > 0) {
-        double deltaMs = static_cast<double>(frameStartQpc.QuadPart - g_lastFrameQpc.QuadPart) * 1000.0
-            / static_cast<double>(g_qpcFrequency.QuadPart);
-        g_frameTimesMs.push_back(deltaMs);
+        g_frameTimesMs.push_back(deltaSeconds * 1000.0);
         while (g_frameTimesMs.size() > kFrameHistoryMax) g_frameTimesMs.pop_front();
         RecomputeFrameStats();
     }
@@ -1139,6 +1209,7 @@ static void DrawFrame(DWORD tickCount) {
         RefreshCpuAndMemoryStats();
         g_lastStatsRefreshTick = nowTick;
     }
+#endif
 
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         g_headScratch[layer].clear();
@@ -1160,7 +1231,12 @@ static void DrawFrame(DWORD tickCount) {
                     s.nextChangeTick = tickCount + static_cast<DWORD>(s.interval);
                 }
 
-                s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f;
+                // Original tuning was "speed * speedMul * 0.6" per 16ms timer
+                // tick (~60fps assumed). deltaTimeScale is 1.0 at 60fps and
+                // scales proportionally at other frame rates, so fall speed
+                // stays constant in real time regardless of how fast frames
+                // are actually being produced (60Hz, 144Hz, uncapped, etc).
+                s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f * deltaTimeScale;
                 if (s.y > g_height) s.y = -static_cast<float>(cfg.fontSize);
 
                 if (s.y + cellF < 0.0f || s.y > static_cast<float>(g_height)) continue;
@@ -1252,7 +1328,18 @@ static void DrawFrame(DWORD tickCount) {
 
     DrawBenchmarkOverlay();
 
+#if UNCAP_FRAMERATE
+    // Vsync disabled: renders as fast as the GPU can produce frames, ignoring
+    // the monitor's refresh rate. Useful for measuring true max throughput,
+    // but will spin the GPU at high power/thermal cost for no visual benefit
+    // (frames faster than the display can show are simply discarded/torn).
+    HRESULT hr = g_swapChain->Present(0, 0);
+#else
+    // Vsync enabled: Present blocks until the next vblank, which paces the
+    // whole loop to the monitor's native refresh rate (e.g. 144Hz) with no
+    // tearing and minimal wasted GPU work.
     HRESULT hr = g_swapChain->Present(1, 0);
+#endif
     if (FAILED(hr)) ++g_droppedPresentCount;
 
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
@@ -1297,7 +1384,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (!g_isPreview) ShowCursor(FALSE);
         ResetMouseTracking(hwnd);
-        SetTimer(hwnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
+
+        // The small embedded preview window (screensaver picker thumbnail) has
+        // no reason to render at full monitor refresh rate -- it's tiny and
+        // usually not even visible for long. Keep it on a modest timer so it
+        // doesn't compete for GPU/CPU with whatever else is running. The
+        // fullscreen case is driven by the main PeekMessage loop in wWinMain
+        // instead, paced by Present()'s vsync wait, so no timer is needed there.
+        if (g_isPreview) {
+            SetTimer(hwnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
+        }
         return 0;
     }
     case WM_TIMER: {
@@ -1494,10 +1590,35 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
 
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    // Fullscreen mode: drain all pending Windows messages without blocking,
+    // then render one frame. Present(1,0) (vsync on) blocks inside DrawFrame
+    // until the next vblank, which is what actually paces this loop to the
+    // monitor's refresh rate (e.g. 144Hz) -- there is no Sleep()/timer needed.
+    // The preview window (small embedded thumbnail, g_isPreview == true) is
+    // still driven by its own WM_TIMER set up in WM_CREATE, so this loop just
+    // pumps its messages normally without an extra render call for it.
+    MSG msg{};
+    bool running = true;
+    while (running) {
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        if (!running) break;
+
+        if (!g_isPreview && g_isVisible) {
+            DrawFrame(static_cast<DWORD>(GetTickCount64()));
+        }
+        else {
+            // Nothing to render right now (preview window renders via its own
+            // timer; fullscreen window is hidden/minimized) -- avoid a hot
+            // spin loop burning a CPU core for no reason.
+            WaitMessage();
+        }
     }
     return static_cast<int>(msg.wParam);
 }
