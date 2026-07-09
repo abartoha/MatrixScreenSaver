@@ -7,7 +7,7 @@
 ![Build](https://img.shields.io/badge/build-Visual%20Studio%202019-purple?logo=visualstudio&logoColor=white)
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
 
-![Beware of the preview](https://raw.githubusercontent.com/abartoha/MatrixScreenSaver/refs/heads/master/output.gif?token=GHSAT0AAAAAAD63WXNV2RHJY2MAK5O35ZNA2SNRD3A)
+![Beware of the preview](https://raw.githubusercontent.com/abartoha/MatrixScreenSaver/refs/heads/master/output.gif)
 
 A modern Windows screensaver inspired by the iconic **digital rain** from **The Matrix** film series. Built in modern C++ with Direct3D11 instanced rendering and Direct2D/DirectWrite glyph rasterization, it recreates the cascading streams of glowing katakana characters using a fully GPU-accelerated rendering pipeline designed for smooth, high-performance animation paced to your monitor's native refresh rate.
 
