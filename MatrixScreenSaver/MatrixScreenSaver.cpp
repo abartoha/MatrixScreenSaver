@@ -30,6 +30,9 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include "resource.h"
+#include "EmbeddedFontLoader.h"
+
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -47,7 +50,7 @@
 // bookkeeping (PDH queries, DXGI memory queries, frame-time history, HUD
 // drawing). Set to 1 to include it (still toggleable at runtime with the 'B'
 // key when enabled here).
-#define ENABLE_BENCHMARK_OVERLAY 0
+#define ENABLE_BENCHMARK_OVERLAY 1
 
 // Set to 1 to disable vsync (Present(0,0)) and let the render loop run as fast
 // as the GPU can produce frames, uncapped by the monitor's refresh rate. This
@@ -144,6 +147,16 @@ static ComPtr<ID2D1Factory1>      g_d2dFactory;
 static ComPtr<ID2D1Device>        g_d2dDevice;
 static ComPtr<ID2D1DeviceContext> g_d2dContext;
 static ComPtr<IDWriteFactory>     g_dwriteFactory;
+
+// Embedded font: registered as a process-private font at startup so
+// DirectWrite can resolve it by family name without a system-wide install.
+static EmbeddedFontLoader g_matrixFontLoader;
+
+// The exact family name baked into MatrixCode.ttf's own 'name' table
+// (name ID 1/16) -- this does NOT have to match the .ttf filename or the
+// resource ID. Verify with a font inspection tool if this string is changed
+// or the embedded font is swapped out.
+static const wchar_t* const kMatrixFontFamilyName = L"Matrix Code NFI";
 
 struct GlyphInstance {
     float destX, destY;
@@ -940,9 +953,12 @@ static HRESULT BuildAtlasForLayer(int layer) {
     const int cell = cfg.fontSize + 4;
 
     ComPtr<IDWriteTextFormat> format;
-    // Typo fix applied: g_dwriteFactory
+    // Prefer the embedded Matrix replica font (registered process-private
+    // via AddFontMemResourceEx); fall back to MS Mincho if it failed to load.
+    const wchar_t* fontFamily = g_matrixFontLoader.IsLoaded()
+        ? kMatrixFontFamilyName : L"MS Mincho";
     HRESULT hr = g_dwriteFactory->CreateTextFormat(
-        L"MS Mincho", nullptr,
+        fontFamily, nullptr,
         DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
         static_cast<float>(cfg.fontSize), L"", &format);
     if (FAILED(hr)) return hr;
@@ -1027,6 +1043,14 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
     hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_dwriteFactory.GetAddressOf()));
     if (FAILED(hr)) { if (failedStage) *failedStage = L"DWriteCreateFactory"; return hr; }
+
+    // Load and register the embedded Matrix replica font before any
+    // CreateTextFormat() call that references it. Failure here is
+    // non-fatal: BuildAtlasForLayer() falls back to a system font.
+    if (!g_matrixFontLoader.IsLoaded()) {
+        g_matrixFontLoader.LoadFromResource(
+            GetModuleHandleW(nullptr), IDR_MATRIXFONT, RT_MATRIXFONT);
+    }
 
     {
         const wchar_t* pipelineCall = nullptr;
@@ -1524,6 +1548,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (!g_isPreview) ShowCursor(TRUE);
         ShutdownPerfCounters();
         DiscardDeviceResources();
+        g_matrixFontLoader.Unload(); // RemoveFontMemResourceEx
         PostQuitMessage(0);
         return 0;
     }

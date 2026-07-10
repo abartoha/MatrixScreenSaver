@@ -1,0 +1,17 @@
+// Fonts.rc
+// Embeds the custom Matrix-replica TrueType font directly into the .scr/.exe
+// binary so end users never need to install the font system-wide.
+//
+// Add this file to the Visual Studio project (Add > Existing Item) so MSVC's
+// resource compiler (rc.exe) links it into the final binary automatically.
+//
+// Place MatrixCode.ttf next to this .rc file, or adjust the path below to
+// point at wherever the font asset lives in your project tree.
+
+#include "resource.h"
+
+// Syntax: <resource-id> <type-name> <path-to-binary-file>
+// The resource compiler embeds the file's raw bytes verbatim; no special
+// TTF-aware handling is needed since we treat it as an opaque BLOB and parse
+// it ourselves via AddFontMemResourceEx at runtime.
+IDR_MATRIXFONT BINFONT "MatrixCode.ttf"

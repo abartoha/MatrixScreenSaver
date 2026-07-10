@@ -19,7 +19,17 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="Source.cpp" />
+    <ClCompile Include="MatrixScreenSaver.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <Font Include="MatrixCode.TTF" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="EmbeddedFontLoader.h" />
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Fonts.rc" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
