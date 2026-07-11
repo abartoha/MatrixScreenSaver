@@ -105,17 +105,50 @@ struct Symbol {
     DWORD   nextChangeTick = 0; // precomputed tick at which value will re-roll
 };
 
+// ---------------------------------------------------------------------------
+// Pseudo-3D "fly-through" depth model
+// ---------------------------------------------------------------------------
+// Each column now owns a persistent Z-depth in addition to its X/Y. Z is in
+// arbitrary "world" units: FAR_Z is where a freshly recycled stream is born
+// (small on screen, near the vanishing point) and 0 is the camera plane. A
+// global camera Z continuously advances (see g_cameraZ), and each column's
+// *local* depth relative to the camera is zLocal = col.z - g_cameraZ. As
+// zLocal shrinks toward 0 the perspective divide in the vertex shader blows
+// the glyph up and pushes it outward, producing the "rushing past" effect.
+static const float FAR_Z = 40.0f;      // spawn/reset plane (deep background)
+static const float NEAR_Z_EPS = 0.35f; // recycle threshold (just before camera plane)
+static const float CAMERA_Z_ADVANCE_PER_SEC = 6.0f; // how fast we "fly" forward
+static const float REFERENCE_Z = 8.0f; // depth at which xOffset/glyph size == the original 2D layout
+
 struct ColumnState {
     int x = 0;
     int layer = 0;
     int speed = 0;
     int length = 0;
     std::vector<Symbol> symbols;
+
+    // --- Fly-through depth state ---
+    float z = FAR_Z;            // absolute world depth; decreases toward the camera
+    float xOffset = 0.0f;       // lateral offset from screen-center at REFERENCE_Z (world units)
+    float yOffsetJitter = 0.0f; // small per-stream depth-plane jitter, adds parallax variety
+    float fadeAlpha = 1.0f;     // fade-in multiplier right after a recycle
 };
 
+// destX/destY are the *reference-plane* (pre-projection) position of the
+// glyph relative to screen-center, in the same pixel-ish units the old flat
+// layout used. destW/destH are likewise the reference-plane (unprojected)
+// glyph size. zLocal is this glyph's depth relative to the camera (camera
+// plane at 0, background at FAR_Z). The actual on-screen position/size is
+// produced by the vertex shader's perspective divide:
+//   screenPos  = center + (destPos  / zLocal) * REFERENCE_Z
+//   screenSize = destSize * (REFERENCE_Z / zLocal)
+// so per-instance data flows through to the GPU as 3D-ish depth-relative
+// values instead of pre-baked 2D screen rects, and the divide itself
+// happens in HLSL.
 struct GlyphInstance {
     float destX, destY;
     float destW, destH;
+    float zLocal;
     float u0, v0;
     float u1, v1;
     float colorR, colorG, colorB, colorA;
@@ -198,6 +231,12 @@ struct MonitorWindow {
 };
 
 static std::vector<std::unique_ptr<MonitorWindow>> g_monitorWindows;
+
+// Global "fly-through" camera depth. This advances forward continuously
+// (see DrawFrame), and every column's zLocal = col.z - g_cameraZ. It is
+// process-global (like the animation clock) so all monitors' fly-through
+// stays in lockstep rather than drifting apart.
+static float g_cameraZ = 0.0f;
 
 // Preview mode (screensaver picker thumbnail) is unaffected by multi-monitor
 // support -- it's always a single embedded child window -- so it keeps its
@@ -376,6 +415,20 @@ static void InitColumns(MonitorWindow& mw, int width, int height) {
             col.speed = 4 + static_cast<int>(FastRandBounded(6));
             col.length = 4 + static_cast<int>(FastRandBounded(36));
 
+            // --- Fly-through depth seeding ---
+            // Reference-plane X offset from screen-center: this is what the
+            // column's on-screen X *would* be if zLocal == REFERENCE_Z (i.e.
+            // it reproduces the original flat 2D column layout at that one
+            // depth). At other depths the shader's perspective divide scales
+            // this outward/inward automatically.
+            col.xOffset = static_cast<float>(col.x) - static_cast<float>(width) * 0.5f;
+            col.yOffsetJitter = (FastRandFloat01() - 0.5f) * static_cast<float>(cfg.fontSize) * 2.0f;
+            // Spread initial depths across the whole near->far range so the
+            // very first frame already looks like a steady-state flythrough
+            // instead of every stream popping in at the far plane at once.
+            col.z = g_cameraZ + NEAR_Z_EPS + FastRandFloat01() * (FAR_Z - NEAR_Z_EPS);
+            col.fadeAlpha = 1.0f;
+
             // Seed the column's head somewhere across the *entire* fall range
             // (from fully above the screen down to fully below it), not just
             // above it. Previously every column always started above y=0 and
@@ -425,13 +478,20 @@ static void InitColumns(MonitorWindow& mw, int width, int height) {
 static const char* kShaderSource = R"(
 cbuffer ViewportCB : register(b0) {
     float2 viewport;
-    float2 _padVp;
+    // referenceZ: the depth at which destPos/destSize are already "actual
+    // size, actual position" (i.e. the divide is a no-op: zLocal == referenceZ
+    // maps 1:1 to the original flat 2D layout). fadeNearZ: zLocal below this
+    // starts fading the glyph out just before it's recycled behind the
+    // camera, so the transition isn't a hard pop.
+    float referenceZ;
+    float fadeNearZ;
 };
 
 struct VSIn {
     float2 localPos : POSITION;
-    float2 destPos   : IPOS;
-    float2 destSize  : ISIZE;
+    float2 destPos   : IPOS;   // reference-plane offset from screen-center (pixels)
+    float2 destSize  : ISIZE;  // reference-plane glyph size (pixels)
+    float  zLocal    : IZLOCAL; // depth relative to camera (camera plane = 0)
     float2 uv0       : IUVA;
     float2 uv1       : IUVB;
     float4 color     : ICOLOR;
@@ -445,13 +505,39 @@ struct VSOut {
 
 VSOut VSMain(VSIn input) {
     VSOut o;
-    float2 pixelPos = input.destPos + input.localPos * input.destSize;
+
+    // --- Perspective projection ---------------------------------------
+    // Guard against division blow-up / sign flip right at the camera
+    // plane; anything this close is about to be recycled by the CPU
+    // anyway, so clamping here just prevents a stray huge/negative quad
+    // for a single frame.
+    float zLocal = max(input.zLocal, 0.01);
+
+    // Basic perspective divide: world-space offset from center, scaled by
+    // (referenceZ / zLocal). As zLocal shrinks toward 0 (stream approaches
+    // the camera) this factor grows without bound, so both the X/Y offset
+    // from center (radial "outward drift") and the glyph size (the
+    // "forest expansion") scale up together -- exactly the effect of
+    // objects rushing past on either side of a highway.
+    float perspective = referenceZ / zLocal;
+
+    float2 projectedOffset = input.destPos * perspective;
+    float2 projectedSize   = input.destSize * perspective;
+
+    float2 pixelPos = (viewport * 0.5) + projectedOffset + input.localPos * projectedSize;
+
     float2 ndc = float2(
         (pixelPos.x / viewport.x) * 2.0 - 1.0,
         1.0 - (pixelPos.y / viewport.y) * 2.0);
     o.pos = float4(ndc, 0.0, 1.0);
     o.uv = lerp(input.uv0, input.uv1, input.localPos);
-    o.color = input.color;
+
+    // Fade the glyph out as it crosses just in front of the fade-near
+    // plane, right before the CPU recycles it back to the far plane, so
+    // the loop point is invisible rather than a hard cut/pop.
+    float fade = saturate((zLocal - 0.01) / max(fadeNearZ - 0.01, 0.0001));
+    o.color = input.color * fade;
+
     return o;
 }
 
@@ -856,9 +942,10 @@ static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,  D3D11_INPUT_PER_VERTEX_DATA,   0 },
         { "IPOS",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 0,  D3D11_INPUT_PER_INSTANCE_DATA, 1 },
         { "ISIZE",    0, DXGI_FORMAT_R32G32_FLOAT,       1, 8,  D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "IUVA",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "IUVB",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 24, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "ICOLOR",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "IZLOCAL",  0, DXGI_FORMAT_R32_FLOAT,          1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "IUVA",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 20, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "IUVB",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 28, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "ICOLOR",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 36, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
     };
     hr = g_d3dDevice->CreateInputLayout(layout, ARRAYSIZE(layout), vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
     if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateInputLayout"; return hr; }
@@ -1369,6 +1456,12 @@ static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
     g_pacingInitialized = true;
     const float deltaTimeScale = static_cast<float>(deltaSeconds) * 60.0f; // 1.0 at 60fps, as original tuning assumed
 
+    // --- Advance the fly-through camera -------------------------------
+    // The camera continuously moves forward in Z; every column's
+    // zLocal = col.z - g_cameraZ shrinks each frame as a result, which is
+    // what drives the perspective growth/outward-drift in the shader.
+    g_cameraZ += CAMERA_Z_ADVANCE_PER_SEC * static_cast<float>(deltaSeconds);
+
 #if ENABLE_BENCHMARK_OVERLAY
     if (g_qpcFrequency.QuadPart > 0) {
         g_frameTimesMs.push_back(deltaSeconds * 1000.0);
@@ -1399,6 +1492,41 @@ static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
         for (size_t colIdx : mw.columnsByLayer[layer]) {
             ColumnState& col = mw.columns[colIdx];
 
+            // --- Fly-through lifecycle: recycle streams that have passed
+            // completely behind the camera. ---
+            float zLocal = col.z - g_cameraZ;
+            if (zLocal <= NEAR_Z_EPS) {
+                // Reset to the far background plane and randomize a new
+                // X/Y track so the recycled stream doesn't just repeat the
+                // same path it came in on.
+                col.z = g_cameraZ + FAR_Z;
+                col.xOffset = (FastRandFloat01() - 0.5f) * static_cast<float>(mw.width) * 1.15f;
+                col.yOffsetJitter = (FastRandFloat01() - 0.5f) * static_cast<float>(cfg.fontSize) * 2.0f;
+                col.fadeAlpha = 0.0f; // fade back in cleanly rather than popping to full brightness
+
+                // Re-roll the fall track's vertical seeding the same way
+                // InitColumns does, so the recycled stream looks freshly
+                // "grown" rather than resuming mid-fall from wherever it
+                // happened to be.
+                int spawnRangeTop = -(col.length * cfg.fontSize);
+                int spawnRangeBottom = (mw.height > 0) ? mw.height : 0;
+                int spawnSpan = spawnRangeBottom - spawnRangeTop;
+                int startY = (spawnSpan > 0)
+                    ? spawnRangeTop + static_cast<int>(FastRandBounded(static_cast<uint32_t>(spawnSpan)))
+                    : 0;
+                for (size_t i = 0; i < col.symbols.size(); ++i) {
+                    col.symbols[i].y = static_cast<float>(startY - static_cast<int>(i) * cfg.fontSize);
+                }
+
+                zLocal = col.z - g_cameraZ;
+            }
+
+            // Smoothly fade the recycled stream back in over roughly the
+            // first quarter-second so the loop point is invisible.
+            if (col.fadeAlpha < 1.0f) {
+                col.fadeAlpha = std::min(1.0f, col.fadeAlpha + static_cast<float>(deltaSeconds) * 4.0f);
+            }
+
             for (auto& s : col.symbols) {
                 if (s.interval > 0 && tickCount >= s.nextChangeTick) {
                     s.value = RandomKatakana();
@@ -1421,14 +1549,21 @@ static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
                 const float u0 = glyphIndex / static_cast<float>(atlas.glyphCount);
                 const float u1 = (glyphIndex + 1) / static_cast<float>(atlas.glyphCount);
 
+                // Reference-plane position/size: identical to the old flat
+                // layout's values (offset from screen-center in X, absolute
+                // fall position in Y), but expressed pre-projection. The
+                // vertex shader multiplies these by (REFERENCE_Z / zLocal)
+                // to get the actual on-screen perspective result, so all
+                // the "3D" math from requirement #2 lives in HLSL, not here.
                 GlyphInstance inst;
-                inst.destX = static_cast<float>(col.x);
-                inst.destY = s.y;
+                inst.destX = col.xOffset;
+                inst.destY = (s.y - static_cast<float>(mw.height) * 0.5f) + col.yOffsetJitter;
                 inst.destW = cellF;
                 inst.destH = cellF;
+                inst.zLocal = zLocal;
                 inst.u0 = u0; inst.v0 = 0.0f;
                 inst.u1 = u1; inst.v1 = 1.0f;
-                inst.colorR = inst.colorG = inst.colorB = inst.colorA = brightness;
+                inst.colorR = inst.colorG = inst.colorB = inst.colorA = brightness * col.fadeAlpha;
 
                 if (s.isHead) mw.headScratch[layer].push_back(inst);
                 else          mw.trailScratch[layer].push_back(inst);
@@ -1438,7 +1573,7 @@ static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (SUCCEEDED(g_d3dContext->Map(g_viewportCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        float vp[4] = { static_cast<float>(mw.width), static_cast<float>(mw.height), 0.0f, 0.0f };
+        float vp[4] = { static_cast<float>(mw.width), static_cast<float>(mw.height), REFERENCE_Z, NEAR_Z_EPS };
         memcpy(mapped.pData, vp, sizeof(vp));
         g_d3dContext->Unmap(g_viewportCB.Get(), 0);
     }
@@ -1459,9 +1594,16 @@ static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
     g_d3dContext->OMSetBlendState(g_premulAlphaBlend.Get(), blendFactor, 0xFFFFFFFF);
 
     GlyphInstance fadeInst{};
-    fadeInst.destX = 0; fadeInst.destY = 0;
+    // Full-screen quads (fade + composite) must exactly cover the viewport
+    // regardless of the perspective system, so they're expressed as
+    // top-left-anchored offsets from center with zLocal pinned to
+    // REFERENCE_Z, which makes the shader's perspective factor exactly 1.0
+    // (a no-op divide) -- i.e. they opt out of the fly-through projection.
+    fadeInst.destX = -static_cast<float>(mw.width) * 0.5f;
+    fadeInst.destY = -static_cast<float>(mw.height) * 0.5f;
     fadeInst.destW = static_cast<float>(mw.width);
     fadeInst.destH = static_cast<float>(mw.height);
+    fadeInst.zLocal = REFERENCE_Z;
     fadeInst.u0 = fadeInst.v0 = 0.0f; fadeInst.u1 = fadeInst.v1 = 1.0f;
     fadeInst.colorR = fadeInst.colorG = fadeInst.colorB = 0.0f;
     fadeInst.colorA = 0.16f;
@@ -1488,9 +1630,11 @@ static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
     g_d3dContext->OMSetBlendState(g_opaqueBlend.Get(), blendFactor, 0xFFFFFFFF);
 
     GlyphInstance compositeInst{};
-    compositeInst.destX = 0; compositeInst.destY = 0;
+    compositeInst.destX = -static_cast<float>(mw.width) * 0.5f;
+    compositeInst.destY = -static_cast<float>(mw.height) * 0.5f;
     compositeInst.destW = static_cast<float>(mw.width);
     compositeInst.destH = static_cast<float>(mw.height);
+    compositeInst.zLocal = REFERENCE_Z;
     compositeInst.u0 = compositeInst.v0 = 0.0f; compositeInst.u1 = compositeInst.v1 = 1.0f;
     compositeInst.colorR = compositeInst.colorG = compositeInst.colorB = compositeInst.colorA = 1.0f;
     static thread_local std::vector<GlyphInstance> compositeScratch(1);
