@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <vector>
+#include <memory>
 #include <string>
 #include <deque>
 #include <numeric>
@@ -29,9 +30,6 @@
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
-
-#include "resource.h"
-#include "EmbeddedFontLoader.h"
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -107,51 +105,111 @@ struct Symbol {
     DWORD   nextChangeTick = 0; // precomputed tick at which value will re-roll
 };
 
-// ---------------------------------------------------------------------------
-// Pseudo-3D "fly-through" depth model
-// ---------------------------------------------------------------------------
-// Each column now owns a persistent Z-depth in addition to its X/Y. Z is in
-// arbitrary "world" units: FAR_Z is where a freshly recycled stream is born
-// (small on screen, near the vanishing point) and 0 is the camera plane. A
-// global camera Z continuously advances (see g_cameraZ), and each column's
-// *local* depth relative to the camera is zLocal = col.z - g_cameraZ. As
-// zLocal shrinks toward 0 the perspective divide in the vertex shader blows
-// the glyph up and pushes it outward, producing the "rushing past" effect.
-static const float FAR_Z = 40.0f;      // spawn/reset plane (deep background)
-static const float NEAR_Z_EPS = 0.35f; // recycle threshold (just before camera plane)
-static const float CAMERA_Z_ADVANCE_PER_SEC = 6.0f; // how fast we "fly" forward
-static const float REFERENCE_Z = 8.0f; // depth at which xOffset/glyph size == the original 2D layout
-
 struct ColumnState {
     int x = 0;
     int layer = 0;
     int speed = 0;
     int length = 0;
     std::vector<Symbol> symbols;
-
-    // --- Fly-through depth state ---
-    float z = FAR_Z;            // absolute world depth; decreases toward the camera
-    float xOffset = 0.0f;       // lateral offset from screen-center at REFERENCE_Z (world units)
-    float yOffsetJitter = 0.0f; // small per-stream depth-plane jitter, adds parallax variety
-    float fadeAlpha = 1.0f;     // fade-in multiplier right after a recycle
 };
 
-static HWND  g_hwnd = nullptr;
-static int   g_width = 0, g_height = 0;
-static std::vector<ColumnState> g_columns;
-static std::vector<std::vector<size_t>> g_columnsByLayer;
+struct GlyphInstance {
+    float destX, destY;
+    float destW, destH;
+    float u0, v0;
+    float u1, v1;
+    float colorR, colorG, colorB, colorA;
+};
+
+struct GlyphAtlas {
+    ComPtr<ID3D11Texture2D>          headTexture, trailTexture;
+    ComPtr<ID3D11ShaderResourceView> headSRV, trailSRV;
+    int   cellWidth = 0;
+    int   cellHeight = 0;
+    int   glyphCount = 0;
+};
+// Atlases are monitor-independent (same glyph textures reused by every
+// window), so these remain shared/global rather than moving into
+// MonitorWindow.
+static GlyphAtlas g_atlases[NUM_LAYERS];
+
+struct LayerInstanceBuffer {
+    ComPtr<ID3D11Buffer> buffer;
+    UINT capacity = 0;
+};
 
 // ---------------------------------------------------------------------------
-// Direct3D11 Pipeline Core
+// Multi-monitor architecture
+// ---------------------------------------------------------------------------
+// A single ID3D11Device/ID3D11DeviceContext is shared across all monitors
+// (device objects, shaders, input layout, blend/sampler states, the glyph
+// atlases, and the white 1x1 texture are all monitor-independent and created
+// exactly once). Each physical monitor gets its own borderless fullscreen
+// HWND with an *independent* IDXGISwapChain, backbuffer RTV, trail
+// ping-pong texture, D2D interop bitmap (for the benchmark overlay), and its
+// own column/symbol simulation state sized to that monitor's resolution.
+//
+// This mirrors the common "one device, many swapchains" pattern used for
+// multi-head fullscreen D3D11 apps: swapchains are cheap per-output objects,
+// while the device/context and anything derived purely from shader bytecode
+// or static vertex data are safe and desirable to share.
+struct MonitorWindow {
+    HWND  hwnd = nullptr;
+    HMONITOR hMonitor = nullptr;
+
+    // Monitor geometry in virtual-desktop coordinates (can be negative --
+    // e.g. a monitor placed to the left of/above the primary). This is what
+    // CreateWindowExW needs, since Win32 window coordinates for
+    // WS_POPUP/no-parent windows are always in virtual-desktop space.
+    int x = 0, y = 0;
+    int width = 0, height = 0;
+    bool isPrimary = false;
+
+    // Per-window D3D11 swapchain + render targets.
+    ComPtr<IDXGISwapChain>         swapChain;
+    ComPtr<ID3D11RenderTargetView> backBufferRTV;
+
+    // Per-window trail ping-pong texture (persistent "fade" accumulation
+    // buffer -- must not be shared across monitors, or motion on one screen
+    // would bleed into another's trail history).
+    ComPtr<ID3D11Texture2D>          trailTexture;
+    ComPtr<ID3D11RenderTargetView>   trailRTV;
+    ComPtr<ID3D11ShaderResourceView> trailSRV;
+
+    // Per-window D2D interop bitmap onto this window's own backbuffer, used
+    // only for the benchmark overlay.
+    ComPtr<ID2D1Bitmap1> overlayD2DTarget;
+
+    // Per-window simulation state (column layout depends on this monitor's
+    // own width/height, so columns cannot be shared globally anymore).
+    std::vector<ColumnState> columns;
+    std::vector<std::vector<size_t>> columnsByLayer;
+
+    // Per-window instance scratch/upload buffers -- kept separate so one
+    // monitor's glyph count doesn't force a reallocation visible to another.
+    std::vector<GlyphInstance> headScratch[NUM_LAYERS];
+    std::vector<GlyphInstance> trailScratch[NUM_LAYERS];
+    LayerInstanceBuffer headInstanceBuf[NUM_LAYERS];
+    LayerInstanceBuffer trailInstanceBuf[NUM_LAYERS];
+    LayerInstanceBuffer fadeBuf;
+    LayerInstanceBuffer compositeBuf;
+
+    bool isVisible = true;
+};
+
+static std::vector<std::unique_ptr<MonitorWindow>> g_monitorWindows;
+
+// Preview mode (screensaver picker thumbnail) is unaffected by multi-monitor
+// support -- it's always a single embedded child window -- so it keeps its
+// own dedicated MonitorWindow-shaped state, created outside the multi-monitor
+// enumeration path.
+static std::unique_ptr<MonitorWindow> g_previewWindow;
+
+// ---------------------------------------------------------------------------
+// Direct3D11 Pipeline Core (shared across all monitor windows)
 // ---------------------------------------------------------------------------
 static ComPtr<ID3D11Device>           g_d3dDevice;
 static ComPtr<ID3D11DeviceContext>    g_d3dContext;
-static ComPtr<IDXGISwapChain>         g_swapChain;
-static ComPtr<ID3D11RenderTargetView> g_backBufferRTV;
-
-static ComPtr<ID3D11Texture2D>          g_trailTexture;
-static ComPtr<ID3D11RenderTargetView>   g_trailRTV;
-static ComPtr<ID3D11ShaderResourceView> g_trailSRV;
 
 static ComPtr<ID3D11VertexShader>  g_vertexShader;
 static ComPtr<ID3D11PixelShader>   g_pixelShader;
@@ -169,52 +227,18 @@ static ComPtr<ID2D1Device>        g_d2dDevice;
 static ComPtr<ID2D1DeviceContext> g_d2dContext;
 static ComPtr<IDWriteFactory>     g_dwriteFactory;
 
-// Embedded font: registered as a process-private font at startup so
-// DirectWrite can resolve it by family name without a system-wide install.
-static EmbeddedFontLoader g_matrixFontLoader;
-
-// The exact family name baked into MatrixCode.ttf's own 'name' table
-// (name ID 1/16) -- this does NOT have to match the .ttf filename or the
-// resource ID. Verify with a font inspection tool if this string is changed
-// or the embedded font is swapped out.
-static const wchar_t* const kMatrixFontFamilyName = L"Matrix Code NFI";
-
-struct GlyphInstance {
-    float destX, destY;
-    float destW, destH;
-    float zLocal;
-    float u0, v0;
-    float u1, v1;
-    float colorR, colorG, colorB, colorA;
-};
-
-struct GlyphAtlas {
-    ComPtr<ID3D11Texture2D>          headTexture, trailTexture;
-    ComPtr<ID3D11ShaderResourceView> headSRV, trailSRV;
-    int   cellWidth = 0;
-    int   cellHeight = 0;
-    int   glyphCount = 0;
-};
-static GlyphAtlas g_atlases[NUM_LAYERS];
-
-struct LayerInstanceBuffer {
-    ComPtr<ID3D11Buffer> buffer;
-    UINT capacity = 0;
-};
-static LayerInstanceBuffer g_headInstanceBuf[NUM_LAYERS];
-static LayerInstanceBuffer g_trailInstanceBuf[NUM_LAYERS];
-
-static std::vector<GlyphInstance> g_headScratch[NUM_LAYERS];
-static std::vector<GlyphInstance> g_trailScratch[NUM_LAYERS];
-
 static bool g_isPreview = false;
+// Tracks how many monitor/preview windows are currently alive, so WM_DESTROY
+// can tell whether it's tearing down the last one (and therefore whether the
+// shared device/pipeline/perf-counters should be released too) versus one of
+// several still-running monitor windows.
+static int  g_liveWindowCount = 0;
 static ULONGLONG g_startTick = 0;
 static const ULONGLONG STARTUP_GRACE_MS = 1000;
 static bool InGracePeriod() { return (GetTickCount64() - g_startTick) < STARTUP_GRACE_MS; }
 
 static POINT g_lastMousePos{};
 static bool  g_mouseInit = false;
-static bool  g_isVisible = true;
 
 // ---------------------------------------------------------------------------
 // Benchmark / Diagnostics Overlay
@@ -277,11 +301,13 @@ static ComPtr<IDXGIAdapter3> g_dxgiAdapter3; // optional, for QueryVideoMemoryIn
 static ULONGLONG g_lastStatsRefreshTick = 0;
 static const ULONGLONG STATS_REFRESH_INTERVAL_MS = 500;
 
-// D2D text resources for the overlay (created alongside other size-dependent resources)
+// D2D text resources for the overlay (created alongside other size-dependent resources).
+// The overlay D2D *bitmap target* is per-window (see MonitorWindow::overlayD2DTarget)
+// since it's a view onto that window's specific backbuffer surface; the text
+// format and brushes here are monitor-independent and stay shared.
 static ComPtr<IDWriteTextFormat>    g_overlayTextFormat;
 static ComPtr<ID2D1SolidColorBrush> g_overlayTextBrush;
 static ComPtr<ID2D1SolidColorBrush> g_overlayBgBrush;
-static ComPtr<ID2D1Bitmap1>         g_overlayD2DTarget; // D2D view of the backbuffer, for direct overlay draw
 #endif // ENABLE_BENCHMARK_OVERLAY
 
 // Real-time frame pacing (always needed, independent of the benchmark overlay,
@@ -331,8 +357,8 @@ static float ComputeDensityScale(int width, int height) {
     return scale;
 }
 
-static void InitColumns(int width, int height) {
-    g_columns.clear();
+static void InitColumns(MonitorWindow& mw, int width, int height) {
+    mw.columns.clear();
     const float densityScale = ComputeDensityScale(width, height);
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         const LayerConfig& cfg = LAYER_CONFIGS[layer];
@@ -349,20 +375,6 @@ static void InitColumns(int width, int height) {
             col.layer = layer;
             col.speed = 4 + static_cast<int>(FastRandBounded(6));
             col.length = 4 + static_cast<int>(FastRandBounded(36));
-
-            // --- Fly-through depth seeding ---
-            // Reference-plane X offset from screen-center: this is what the
-            // column's on-screen X *would* be if zLocal == REFERENCE_Z (i.e.
-            // it reproduces the original flat 2D column layout at that one
-            // depth). At other depths the shader's perspective divide scales
-            // this outward/inward automatically.
-            col.xOffset = static_cast<float>(col.x) - static_cast<float>(width) * 0.5f;
-            col.yOffsetJitter = (FastRandFloat01() - 0.5f) * static_cast<float>(cfg.fontSize) * 2.0f;
-            // Spread initial depths across the whole near->far range so the
-            // very first frame already looks like a steady-state flythrough
-            // instead of every stream popping in at the far plane at once.
-            col.z = g_cameraZ + NEAR_Z_EPS + FastRandFloat01() * (FAR_Z - NEAR_Z_EPS);
-            col.fadeAlpha = 1.0f;
 
             // Seed the column's head somewhere across the *entire* fall range
             // (from fully above the screen down to fully below it), not just
@@ -397,13 +409,13 @@ static void InitColumns(int width, int height) {
                 s.nextChangeTick = static_cast<DWORD>(FastRandBounded(static_cast<uint32_t>(s.interval)));
                 col.symbols.push_back(s);
             }
-            g_columns.push_back(std::move(col));
+            mw.columns.push_back(std::move(col));
         }
     }
 
-    g_columnsByLayer.assign(NUM_LAYERS, {});
-    for (size_t i = 0; i < g_columns.size(); ++i) {
-        g_columnsByLayer[g_columns[i].layer].push_back(i);
+    mw.columnsByLayer.assign(NUM_LAYERS, {});
+    for (size_t i = 0; i < mw.columns.size(); ++i) {
+        mw.columnsByLayer[mw.columns[i].layer].push_back(i);
     }
 }
 
@@ -413,20 +425,13 @@ static void InitColumns(int width, int height) {
 static const char* kShaderSource = R"(
 cbuffer ViewportCB : register(b0) {
     float2 viewport;
-    // referenceZ: the depth at which destPos/destSize are already "actual
-    // size, actual position" (i.e. the divide is a no-op: zLocal == referenceZ
-    // maps 1:1 to the original flat 2D layout). fadeNearZ: zLocal below this
-    // starts fading the glyph out just before it's recycled behind the
-    // camera, so the transition isn't a hard pop.
-    float referenceZ;
-    float fadeNearZ;
+    float2 _padVp;
 };
 
 struct VSIn {
     float2 localPos : POSITION;
-    float2 destPos   : IPOS;   // reference-plane offset from screen-center (pixels)
-    float2 destSize  : ISIZE;  // reference-plane glyph size (pixels)
-    float  zLocal    : IZLOCAL; // depth relative to camera (camera plane = 0)
+    float2 destPos   : IPOS;
+    float2 destSize  : ISIZE;
     float2 uv0       : IUVA;
     float2 uv1       : IUVB;
     float4 color     : ICOLOR;
@@ -440,39 +445,13 @@ struct VSOut {
 
 VSOut VSMain(VSIn input) {
     VSOut o;
-
-    // --- Perspective projection ---------------------------------------
-    // Guard against division blow-up / sign flip right at the camera
-    // plane; anything this close is about to be recycled by the CPU
-    // anyway, so clamping here just prevents a stray huge/negative quad
-    // for a single frame.
-    float zLocal = max(input.zLocal, 0.01);
-
-    // Basic perspective divide: world-space offset from center, scaled by
-    // (referenceZ / zLocal). As zLocal shrinks toward 0 (stream approaches
-    // the camera) this factor grows without bound, so both the X/Y offset
-    // from center (radial "outward drift") and the glyph size (the
-    // "forest expansion") scale up together -- exactly the effect of
-    // objects rushing past on either side of a highway.
-    float perspective = referenceZ / zLocal;
-
-    float2 projectedOffset = input.destPos * perspective;
-    float2 projectedSize   = input.destSize * perspective;
-
-    float2 pixelPos = (viewport * 0.5) + projectedOffset + input.localPos * projectedSize;
-
+    float2 pixelPos = input.destPos + input.localPos * input.destSize;
     float2 ndc = float2(
         (pixelPos.x / viewport.x) * 2.0 - 1.0,
         1.0 - (pixelPos.y / viewport.y) * 2.0);
     o.pos = float4(ndc, 0.0, 1.0);
     o.uv = lerp(input.uv0, input.uv1, input.localPos);
-
-    // Fade the glyph out as it crosses just in front of the fade-near
-    // plane, right before the CPU recycles it back to the far plane, so
-    // the loop point is invisible rather than a hard cut/pop.
-    float fade = saturate((zLocal - 0.01) / max(fadeNearZ - 0.01, 0.0001));
-    o.color = input.color * fade;
-
+    o.color = input.color;
     return o;
 }
 
@@ -722,21 +701,13 @@ static inline void RefreshCpuAndMemoryStats() {}
 // ---------------------------------------------------------------------------
 // Direct3D11 Setup Execution Contracts
 // ---------------------------------------------------------------------------
-static HRESULT CreateD3DDeviceAndSwapChain(HWND hwnd, int width, int height) {
-    DXGI_SWAP_CHAIN_DESC scd = {};
-    scd.BufferCount = 1;
-    scd.BufferDesc.Width = width;
-    scd.BufferDesc.Height = height;
-    scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator = 0;
-    scd.BufferDesc.RefreshRate.Denominator = 1;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow = hwnd;
-    scd.SampleDesc.Count = 1;
-    scd.SampleDesc.Quality = 0;
-    scd.Windowed = TRUE;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
+// Creates the single shared ID3D11Device/ID3D11DeviceContext used by every
+// monitor window. Adapter selection (explicit high-perf adapter via
+// IDXGIFactory6, falling back to hardware, falling back to WARP) is
+// unchanged from the original single-window version -- it just no longer
+// creates a swapchain at the same time, since a device is monitor-agnostic
+// but a swapchain is tied to one specific output window.
+static HRESULT CreateD3DDevice() {
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
     D3D_FEATURE_LEVEL chosen{};
 
@@ -765,37 +736,36 @@ static HRESULT CreateD3DDeviceAndSwapChain(HWND hwnd, int width, int height) {
 
     HRESULT hr;
     if (explicitAdapter) {
-        hr = D3D11CreateDeviceAndSwapChain(
+        hr = D3D11CreateDevice(
             explicitAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, deviceFlags | debugFlag,
             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+            &g_d3dDevice, &chosen, &g_d3dContext);
         if (FAILED(hr) && debugFlag != 0) {
-            hr = D3D11CreateDeviceAndSwapChain(
+            hr = D3D11CreateDevice(
                 explicitAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, deviceFlags,
                 levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-                &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+                &g_d3dDevice, &chosen, &g_d3dContext);
         }
     }
     else {
-        // Typo fix applied: singular g_d3dContext
-        hr = D3D11CreateDeviceAndSwapChain(
+        hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags | debugFlag,
             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+            &g_d3dDevice, &chosen, &g_d3dContext);
 
         if (FAILED(hr) && debugFlag != 0) {
-            hr = D3D11CreateDeviceAndSwapChain(
+            hr = D3D11CreateDevice(
                 nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags,
                 levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-                &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+                &g_d3dDevice, &chosen, &g_d3dContext);
         }
     }
 
     if (FAILED(hr)) {
-        hr = D3D11CreateDeviceAndSwapChain(
+        hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_WARP, nullptr, deviceFlags,
             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-            &scd, &g_swapChain, &g_d3dDevice, &chosen, &g_d3dContext);
+            &g_d3dDevice, &chosen, &g_d3dContext);
     }
 
     if (SUCCEEDED(hr)) {
@@ -821,6 +791,55 @@ static HRESULT CreateD3DDeviceAndSwapChain(HWND hwnd, int width, int height) {
     return hr;
 }
 
+// Creates an independent swapchain for one monitor window against the
+// already-created shared g_d3dDevice. Must be called once per HWND, after
+// CreateD3DDevice() has succeeded. DXGI requires the factory used to create
+// a swapchain be obtained from the same adapter/device chain as the device
+// itself, so we pull the factory via the device's parent adapter rather than
+// creating a fresh, possibly-mismatched IDXGIFactory1.
+static HRESULT CreateSwapChainForWindow(HWND hwnd, int width, int height,
+    ComPtr<IDXGISwapChain>& outSwapChain) {
+    if (!g_d3dDevice) return E_FAIL;
+
+    ComPtr<IDXGIDevice> dxgiDevice;
+    HRESULT hr = g_d3dDevice.As(&dxgiDevice);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IDXGIAdapter> adapter;
+    hr = dxgiDevice->GetAdapter(&adapter);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IDXGIFactory1> factory;
+    hr = adapter->GetParent(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return hr;
+
+    DXGI_SWAP_CHAIN_DESC scd = {};
+    scd.BufferCount = 1;
+    scd.BufferDesc.Width = width;
+    scd.BufferDesc.Height = height;
+    scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    scd.BufferDesc.RefreshRate.Numerator = 0;
+    scd.BufferDesc.RefreshRate.Denominator = 1;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.OutputWindow = hwnd;
+    scd.SampleDesc.Count = 1;
+    scd.SampleDesc.Quality = 0;
+    scd.Windowed = TRUE;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    outSwapChain.Reset();
+    hr = factory->CreateSwapChain(g_d3dDevice.Get(), &scd, &outSwapChain);
+    if (FAILED(hr)) return hr;
+
+    // Prevent DXGI's default Alt+Enter fullscreen-toggle handling from ever
+    // engaging -- each window is already borderless/topmost and manually
+    // sized to its own monitor's exact bounds, so DXGI-managed exclusive
+    // fullscreen would fight with that per-monitor layout.
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+
+    return S_OK;
+}
+
 static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
     ComPtr<ID3DBlob> vsBlob, psBlob;
     HRESULT hr = CompileShader("VSMain", "vs_4_0", vsBlob);
@@ -837,10 +856,9 @@ static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,  D3D11_INPUT_PER_VERTEX_DATA,   0 },
         { "IPOS",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 0,  D3D11_INPUT_PER_INSTANCE_DATA, 1 },
         { "ISIZE",    0, DXGI_FORMAT_R32G32_FLOAT,       1, 8,  D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "IZLOCAL",  0, DXGI_FORMAT_R32_FLOAT,          1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "IUVA",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 20, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "IUVB",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 28, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "ICOLOR",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 36, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "IUVA",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "IUVB",     0, DXGI_FORMAT_R32G32_FLOAT,       1, 24, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "ICOLOR",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
     };
     hr = g_d3dDevice->CreateInputLayout(layout, ARRAYSIZE(layout), vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
     if (FAILED(hr)) { if (failedCall) *failedCall = L"CreateInputLayout"; return hr; }
@@ -904,11 +922,11 @@ static HRESULT CreatePipelineObjects(const wchar_t** failedCall = nullptr) {
     return S_OK;
 }
 
-static HRESULT CreateSizeDependentResources(int width, int height) {
+static HRESULT CreateSizeDependentResources(MonitorWindow& mw, int width, int height) {
     ComPtr<ID3D11Texture2D> backBuffer;
-    HRESULT hr = g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    HRESULT hr = mw.swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
     if (FAILED(hr)) return hr;
-    hr = g_d3dDevice->CreateRenderTargetView(backBuffer.Get(), nullptr, &g_backBufferRTV);
+    hr = g_d3dDevice->CreateRenderTargetView(backBuffer.Get(), nullptr, &mw.backBufferRTV);
     if (FAILED(hr)) return hr;
 
     D3D11_TEXTURE2D_DESC ttd = {};
@@ -917,27 +935,29 @@ static HRESULT CreateSizeDependentResources(int width, int height) {
     ttd.SampleDesc.Count = 1;
     ttd.Usage = D3D11_USAGE_DEFAULT;
     ttd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    hr = g_d3dDevice->CreateTexture2D(&ttd, nullptr, &g_trailTexture);
+    hr = g_d3dDevice->CreateTexture2D(&ttd, nullptr, &mw.trailTexture);
     if (FAILED(hr)) return hr;
-    hr = g_d3dDevice->CreateRenderTargetView(g_trailTexture.Get(), nullptr, &g_trailRTV);
+    hr = g_d3dDevice->CreateRenderTargetView(mw.trailTexture.Get(), nullptr, &mw.trailRTV);
     if (FAILED(hr)) return hr;
-    hr = g_d3dDevice->CreateShaderResourceView(g_trailTexture.Get(), nullptr, &g_trailSRV);
+    hr = g_d3dDevice->CreateShaderResourceView(mw.trailTexture.Get(), nullptr, &mw.trailSRV);
     if (FAILED(hr)) return hr;
 
     const float black[4] = { 0, 0, 0, 1 };
-    g_d3dContext->ClearRenderTargetView(g_trailRTV.Get(), black);
+    g_d3dContext->ClearRenderTargetView(mw.trailRTV.Get(), black);
 
 #if ENABLE_BENCHMARK_OVERLAY
-    // D2D bitmap view onto the swap chain's backbuffer surface, used only to
-    // draw the benchmark overlay text on top of the composited frame.
-    g_overlayD2DTarget.Reset();
+    // D2D bitmap view onto this window's own swap chain backbuffer surface,
+    // used only to draw the benchmark overlay text on top of its composited
+    // frame. Each monitor window gets its own -- it cannot be shared since
+    // each backbuffer is a distinct DXGI surface.
+    mw.overlayD2DTarget.Reset();
     if (g_d2dContext) {
         ComPtr<IDXGISurface> backSurface;
         if (SUCCEEDED(backBuffer.As(&backSurface))) {
             D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
-            g_d2dContext->CreateBitmapFromDxgiSurface(backSurface.Get(), &bp, &g_overlayD2DTarget);
+            g_d2dContext->CreateBitmapFromDxgiSurface(backSurface.Get(), &bp, &mw.overlayD2DTarget);
         }
     }
 #endif
@@ -1023,12 +1043,9 @@ static HRESULT BuildAtlasForLayer(int layer) {
     const int cell = cfg.fontSize + 4;
 
     ComPtr<IDWriteTextFormat> format;
-    // Prefer the embedded Matrix replica font (registered process-private
-    // via AddFontMemResourceEx); fall back to MS Mincho if it failed to load.
-    const wchar_t* fontFamily = g_matrixFontLoader.IsLoaded()
-        ? kMatrixFontFamilyName : L"MS Mincho";
+    // Typo fix applied: g_dwriteFactory
     HRESULT hr = g_dwriteFactory->CreateTextFormat(
-        fontFamily, nullptr,
+        L"MS Mincho", nullptr,
         DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
         static_cast<float>(cfg.fontSize), L"", &format);
     if (FAILED(hr)) return hr;
@@ -1049,23 +1066,45 @@ static HRESULT BuildAtlasForLayer(int layer) {
     return S_OK;
 }
 
-static void DiscardDeviceResources() {
+// Releases everything that is specific to one monitor window: its swapchain
+// render target, trail ping-pong texture, D2D overlay bitmap, and per-window
+// instance upload buffers. Does NOT touch the shared device, shaders, or
+// glyph atlases -- those survive independently of any single window.
+static void DiscardWindowResources(MonitorWindow& mw) {
+    for (int layer = 0; layer < NUM_LAYERS; ++layer) {
+        mw.headInstanceBuf[layer].buffer.Reset();
+        mw.headInstanceBuf[layer].capacity = 0;
+        mw.trailInstanceBuf[layer].buffer.Reset();
+        mw.trailInstanceBuf[layer].capacity = 0;
+    }
+    mw.fadeBuf.buffer.Reset();
+    mw.fadeBuf.capacity = 0;
+    mw.compositeBuf.buffer.Reset();
+    mw.compositeBuf.capacity = 0;
+    mw.trailTexture.Reset();
+    mw.trailRTV.Reset();
+    mw.trailSRV.Reset();
+    mw.backBufferRTV.Reset();
+#if ENABLE_BENCHMARK_OVERLAY
+    mw.overlayD2DTarget.Reset();
+#endif
+    mw.swapChain.Reset();
+}
+
+// Releases the shared device/context, shared pipeline objects (shaders,
+// input layout, blend/sampler states, white texture), the shared glyph
+// atlases, and shared D2D/DWrite objects. Callers must have already torn
+// down every MonitorWindow's per-window resources (via
+// DiscardWindowResources) before calling this, since those per-window
+// objects were created against this device.
+static void DiscardSharedDeviceResources() {
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         g_atlases[layer].headTexture.Reset();
         g_atlases[layer].trailTexture.Reset();
         g_atlases[layer].headSRV.Reset();
         g_atlases[layer].trailSRV.Reset();
-        g_headInstanceBuf[layer].buffer.Reset();
-        g_headInstanceBuf[layer].capacity = 0;
-        g_trailInstanceBuf[layer].buffer.Reset();
-        g_trailInstanceBuf[layer].capacity = 0;
     }
-    g_trailTexture.Reset();
-    g_trailRTV.Reset();
-    g_trailSRV.Reset();
-    g_backBufferRTV.Reset();
 #if ENABLE_BENCHMARK_OVERLAY
-    g_overlayD2DTarget.Reset();
     g_overlayTextFormat.Reset();
     g_overlayTextBrush.Reset();
     g_overlayBgBrush.Reset();
@@ -1083,20 +1122,27 @@ static void DiscardDeviceResources() {
     g_opaqueBlend.Reset();
     g_whiteTexture.Reset();
     g_whiteSRV.Reset();
-    g_swapChain.Reset();
     g_d3dContext.Reset();
     g_d3dDevice.Reset();
 }
 
-static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-    int width = rc.right - rc.left, height = rc.bottom - rc.top;
-    if (width < 1) width = 1;
-    if (height < 1) height = 1;
+// Convenience helper for the device-lost/reset recovery path: tears down
+// every monitor window's resources plus the shared device in one call.
+static void DiscardAllDeviceResources() {
+    for (auto& mwPtr : g_monitorWindows) {
+        if (mwPtr) DiscardWindowResources(*mwPtr);
+    }
+    if (g_previewWindow) DiscardWindowResources(*g_previewWindow);
+    DiscardSharedDeviceResources();
+}
 
-    HRESULT hr = CreateD3DDeviceAndSwapChain(hwnd, width, height);
-    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateD3DDeviceAndSwapChain"; return hr; }
+// One-time setup of everything monitor-independent: the shared D3D11
+// device/context, D2D/DWrite factories, the shader/pipeline objects, the
+// overlay text format/brushes, and the glyph atlases. Must succeed exactly
+// once before any MonitorWindow is initialized.
+static HRESULT InitSharedPipeline(const wchar_t** failedStage = nullptr) {
+    HRESULT hr = CreateD3DDevice();
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateD3DDevice"; return hr; }
 
     hr = D2D1CreateFactory<ID2D1Factory1>(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2dFactory.GetAddressOf());
     if (FAILED(hr)) { if (failedStage) *failedStage = L"D2D1CreateFactory"; return hr; }
@@ -1114,14 +1160,6 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
         reinterpret_cast<IUnknown**>(g_dwriteFactory.GetAddressOf()));
     if (FAILED(hr)) { if (failedStage) *failedStage = L"DWriteCreateFactory"; return hr; }
 
-    // Load and register the embedded Matrix replica font before any
-    // CreateTextFormat() call that references it. Failure here is
-    // non-fatal: BuildAtlasForLayer() falls back to a system font.
-    if (!g_matrixFontLoader.IsLoaded()) {
-        g_matrixFontLoader.LoadFromResource(
-            GetModuleHandleW(nullptr), IDR_MATRIXFONT, RT_MATRIXFONT);
-    }
-
     {
         const wchar_t* pipelineCall = nullptr;
         hr = CreatePipelineObjects(&pipelineCall);
@@ -1134,9 +1172,6 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
             return hr;
         }
     }
-
-    hr = CreateSizeDependentResources(width, height);
-    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateSizeDependentResources"; return hr; }
 
     hr = CreateOverlayResources();
     if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateOverlayResources"; return hr; }
@@ -1157,6 +1192,26 @@ static HRESULT InitDirect2D(HWND hwnd, const wchar_t** failedStage = nullptr) {
         hr = BuildAtlasForLayer(i);
         if (FAILED(hr)) { if (failedStage) *failedStage = L"BuildAtlasForLayer"; return hr; }
     }
+    return S_OK;
+}
+
+// Per-window setup: creates this window's swapchain and its size-dependent
+// resources (backbuffer RTV, trail texture, overlay D2D bitmap) against the
+// already-initialized shared device. Must be called after
+// InitSharedPipeline() has succeeded at least once.
+static HRESULT InitMonitorWindow(MonitorWindow& mw, const wchar_t** failedStage = nullptr) {
+    RECT rc;
+    GetClientRect(mw.hwnd, &rc);
+    int width = rc.right - rc.left, height = rc.bottom - rc.top;
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+
+    HRESULT hr = CreateSwapChainForWindow(mw.hwnd, width, height, mw.swapChain);
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateSwapChainForWindow"; return hr; }
+
+    hr = CreateSizeDependentResources(mw, width, height);
+    if (FAILED(hr)) { if (failedStage) *failedStage = L"CreateSizeDependentResources"; return hr; }
+
     return S_OK;
 }
 
@@ -1236,8 +1291,8 @@ static std::wstring FormatBytesMB(SIZE_T bytes) {
 // after the D3D11 composite pass has finished writing it. This runs through
 // the D3D/D2D interop device context so it composites correctly on top of
 // the Matrix rain without needing its own render target.
-static void DrawBenchmarkOverlay() {
-    if (!g_benchEnabled || !g_d2dContext || !g_overlayD2DTarget || !g_overlayTextFormat) return;
+static void DrawBenchmarkOverlay(MonitorWindow& mw) {
+    if (!g_benchEnabled || !g_d2dContext || !mw.overlayD2DTarget || !g_overlayTextFormat) return;
 
     wchar_t buf[1024];
     int len = swprintf_s(buf,
@@ -1261,7 +1316,7 @@ static void DrawBenchmarkOverlay() {
     );
     if (len < 0) return;
 
-    g_d2dContext->SetTarget(g_overlayD2DTarget.Get());
+    g_d2dContext->SetTarget(mw.overlayD2DTarget.Get());
     g_d2dContext->BeginDraw();
 
     const float pad = 10.0f;
@@ -1285,18 +1340,21 @@ static void DrawBenchmarkOverlay() {
     g_d2dContext->SetTarget(nullptr);
 }
 #else
-static inline void DrawBenchmarkOverlay() {}
+static inline void DrawBenchmarkOverlay(MonitorWindow&) {}
 #endif // ENABLE_BENCHMARK_OVERLAY
 
-static void DrawFrame(DWORD tickCount) {
-    if (!g_d3dContext || !g_trailRTV || !g_backBufferRTV) return;
+static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
+    if (!g_d3dContext || !mw.trailRTV || !mw.backBufferRTV) return;
 
     // Real elapsed time since the previous frame. This always runs (regardless
     // of the benchmark macro) because animation speed must stay correct now
     // that the render loop is paced by Present()/vsync instead of a fixed
     // 16ms Win32 timer tick -- frame rate can now vary (e.g. 60 vs 144Hz), so
     // all per-frame motion must scale by real delta time rather than assuming
-    // a fixed tick.
+    // a fixed tick. Frame pacing is process-global (not per-monitor): with
+    // several independent swapchains, each Present() below paces against its
+    // own monitor's vblank, but the animation clock driving the simulation is
+    // shared so all monitors advance in lockstep rather than drifting apart.
     LARGE_INTEGER frameStartQpc;
     QueryPerformanceCounter(&frameStartQpc);
     double deltaSeconds = 0.016; // sane fallback for the very first frame
@@ -1310,12 +1368,6 @@ static void DrawFrame(DWORD tickCount) {
     g_pacingLastFrameQpc = frameStartQpc;
     g_pacingInitialized = true;
     const float deltaTimeScale = static_cast<float>(deltaSeconds) * 60.0f; // 1.0 at 60fps, as original tuning assumed
-
-    // --- Advance the fly-through camera -------------------------------
-    // The camera continuously moves forward in Z; every column's
-    // zLocal = col.z - g_cameraZ shrinks each frame as a result, which is
-    // what drives the perspective growth/outward-drift in the shader.
-    g_cameraZ += CAMERA_Z_ADVANCE_PER_SEC * static_cast<float>(deltaSeconds);
 
 #if ENABLE_BENCHMARK_OVERLAY
     if (g_qpcFrequency.QuadPart > 0) {
@@ -1334,8 +1386,8 @@ static void DrawFrame(DWORD tickCount) {
 #endif
 
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
-        g_headScratch[layer].clear();
-        g_trailScratch[layer].clear();
+        mw.headScratch[layer].clear();
+        mw.trailScratch[layer].clear();
     }
 
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
@@ -1344,43 +1396,8 @@ static void DrawFrame(DWORD tickCount) {
         const float cellF = static_cast<float>(atlas.cellWidth);
         const float brightness = cfg.brightnessMul;
 
-        for (size_t colIdx : g_columnsByLayer[layer]) {
-            ColumnState& col = g_columns[colIdx];
-
-            // --- Fly-through lifecycle: recycle streams that have passed
-            // completely behind the camera. ---
-            float zLocal = col.z - g_cameraZ;
-            if (zLocal <= NEAR_Z_EPS) {
-                // Reset to the far background plane and randomize a new
-                // X/Y track so the recycled stream doesn't just repeat the
-                // same path it came in on.
-                col.z = g_cameraZ + FAR_Z;
-                col.xOffset = (FastRandFloat01() - 0.5f) * static_cast<float>(mw.width) * 1.15f;
-                col.yOffsetJitter = (FastRandFloat01() - 0.5f) * static_cast<float>(cfg.fontSize) * 2.0f;
-                col.fadeAlpha = 0.0f; // fade back in cleanly rather than popping to full brightness
-
-                // Re-roll the fall track's vertical seeding the same way
-                // InitColumns does, so the recycled stream looks freshly
-                // "grown" rather than resuming mid-fall from wherever it
-                // happened to be.
-                int spawnRangeTop = -(col.length * cfg.fontSize);
-                int spawnRangeBottom = (mw.height > 0) ? mw.height : 0;
-                int spawnSpan = spawnRangeBottom - spawnRangeTop;
-                int startY = (spawnSpan > 0)
-                    ? spawnRangeTop + static_cast<int>(FastRandBounded(static_cast<uint32_t>(spawnSpan)))
-                    : 0;
-                for (size_t i = 0; i < col.symbols.size(); ++i) {
-                    col.symbols[i].y = static_cast<float>(startY - static_cast<int>(i) * cfg.fontSize);
-                }
-
-                zLocal = col.z - g_cameraZ;
-            }
-
-            // Smoothly fade the recycled stream back in over roughly the
-            // first quarter-second so the loop point is invisible.
-            if (col.fadeAlpha < 1.0f) {
-                col.fadeAlpha = std::min(1.0f, col.fadeAlpha + static_cast<float>(deltaSeconds) * 4.0f);
-            }
+        for (size_t colIdx : mw.columnsByLayer[layer]) {
+            ColumnState& col = mw.columns[colIdx];
 
             for (auto& s : col.symbols) {
                 if (s.interval > 0 && tickCount >= s.nextChangeTick) {
@@ -1394,9 +1411,9 @@ static void DrawFrame(DWORD tickCount) {
                 // stays constant in real time regardless of how fast frames
                 // are actually being produced (60Hz, 144Hz, uncapped, etc).
                 s.y += static_cast<float>(s.speed) * cfg.speedMul * 0.6f * deltaTimeScale;
-                if (s.y > g_height) s.y = -static_cast<float>(cfg.fontSize);
+                if (s.y > mw.height) s.y = -static_cast<float>(cfg.fontSize);
 
-                if (s.y + cellF < 0.0f || s.y > static_cast<float>(g_height)) continue;
+                if (s.y + cellF < 0.0f || s.y > static_cast<float>(mw.height)) continue;
 
                 int glyphIndex = static_cast<int>(s.value) - 0x30A0;
                 if (glyphIndex < 0 || glyphIndex >= atlas.glyphCount) continue;
@@ -1404,31 +1421,24 @@ static void DrawFrame(DWORD tickCount) {
                 const float u0 = glyphIndex / static_cast<float>(atlas.glyphCount);
                 const float u1 = (glyphIndex + 1) / static_cast<float>(atlas.glyphCount);
 
-                // Reference-plane position/size: identical to the old flat
-                // layout's values (offset from screen-center in X, absolute
-                // fall position in Y), but expressed pre-projection. The
-                // vertex shader multiplies these by (REFERENCE_Z / zLocal)
-                // to get the actual on-screen perspective result, so all
-                // the "3D" math from requirement #2 lives in HLSL, not here.
                 GlyphInstance inst;
-                inst.destX = col.xOffset;
-                inst.destY = (s.y - static_cast<float>(mw.height) * 0.5f) + col.yOffsetJitter;
+                inst.destX = static_cast<float>(col.x);
+                inst.destY = s.y;
                 inst.destW = cellF;
                 inst.destH = cellF;
-                inst.zLocal = zLocal;
                 inst.u0 = u0; inst.v0 = 0.0f;
                 inst.u1 = u1; inst.v1 = 1.0f;
-                inst.colorR = inst.colorG = inst.colorB = inst.colorA = brightness * col.fadeAlpha;
+                inst.colorR = inst.colorG = inst.colorB = inst.colorA = brightness;
 
-                if (s.isHead) g_headScratch[layer].push_back(inst);
-                else          g_trailScratch[layer].push_back(inst);
+                if (s.isHead) mw.headScratch[layer].push_back(inst);
+                else          mw.trailScratch[layer].push_back(inst);
             }
         }
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (SUCCEEDED(g_d3dContext->Map(g_viewportCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        float vp[4] = { static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, 0.0f };
+        float vp[4] = { static_cast<float>(mw.width), static_cast<float>(mw.height), 0.0f, 0.0f };
         memcpy(mapped.pData, vp, sizeof(vp));
         g_d3dContext->Unmap(g_viewportCB.Get(), 0);
     }
@@ -1441,77 +1451,89 @@ static void DrawFrame(DWORD tickCount) {
     g_d3dContext->PSSetShader(g_pixelShader.Get(), nullptr, 0);
     g_d3dContext->PSSetSamplers(0, 1, g_samplerState.GetAddressOf());
 
-    D3D11_VIEWPORT vp = { 0, 0, static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, 1.0f };
+    D3D11_VIEWPORT vp = { 0, 0, static_cast<float>(mw.width), static_cast<float>(mw.height), 0.0f, 1.0f };
     g_d3dContext->RSSetViewports(1, &vp);
 
     const float blendFactor[4] = { 0, 0, 0, 0 };
-    g_d3dContext->OMSetRenderTargets(1, g_trailRTV.GetAddressOf(), nullptr);
+    g_d3dContext->OMSetRenderTargets(1, mw.trailRTV.GetAddressOf(), nullptr);
     g_d3dContext->OMSetBlendState(g_premulAlphaBlend.Get(), blendFactor, 0xFFFFFFFF);
 
     GlyphInstance fadeInst{};
     fadeInst.destX = 0; fadeInst.destY = 0;
-    fadeInst.destW = static_cast<float>(g_width);
-    fadeInst.destH = static_cast<float>(g_height);
+    fadeInst.destW = static_cast<float>(mw.width);
+    fadeInst.destH = static_cast<float>(mw.height);
     fadeInst.u0 = fadeInst.v0 = 0.0f; fadeInst.u1 = fadeInst.v1 = 1.0f;
     fadeInst.colorR = fadeInst.colorG = fadeInst.colorB = 0.0f;
     fadeInst.colorA = 0.16f;
-    static std::vector<GlyphInstance> fadeScratch(1);
+    static thread_local std::vector<GlyphInstance> fadeScratch(1);
     fadeScratch[0] = fadeInst;
-    static LayerInstanceBuffer fadeBuf;
-    UploadInstances(fadeBuf, fadeScratch);
-    DrawInstanced(g_whiteSRV.Get(), fadeBuf, 1);
+    UploadInstances(mw.fadeBuf, fadeScratch);
+    DrawInstanced(g_whiteSRV.Get(), mw.fadeBuf, 1);
 
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         const GlyphAtlas& atlas = g_atlases[layer];
-        if (!g_trailScratch[layer].empty()) {
-            UploadInstances(g_trailInstanceBuf[layer], g_trailScratch[layer]);
-            DrawInstanced(atlas.trailSRV.Get(), g_trailInstanceBuf[layer], static_cast<UINT>(g_trailScratch[layer].size()));
+        if (!mw.trailScratch[layer].empty()) {
+            UploadInstances(mw.trailInstanceBuf[layer], mw.trailScratch[layer]);
+            DrawInstanced(atlas.trailSRV.Get(), mw.trailInstanceBuf[layer], static_cast<UINT>(mw.trailScratch[layer].size()));
         }
-        if (!g_headScratch[layer].empty()) {
-            UploadInstances(g_headInstanceBuf[layer], g_headScratch[layer]);
-            DrawInstanced(atlas.headSRV.Get(), g_headInstanceBuf[layer], static_cast<UINT>(g_headScratch[layer].size()));
+        if (!mw.headScratch[layer].empty()) {
+            UploadInstances(mw.headInstanceBuf[layer], mw.headScratch[layer]);
+            DrawInstanced(atlas.headSRV.Get(), mw.headInstanceBuf[layer], static_cast<UINT>(mw.headScratch[layer].size()));
         }
     }
 
     ID3D11ShaderResourceView* nullSRV = nullptr;
     g_d3dContext->PSSetShaderResources(0, 1, &nullSRV);
-    g_d3dContext->OMSetRenderTargets(1, g_backBufferRTV.GetAddressOf(), nullptr);
+    g_d3dContext->OMSetRenderTargets(1, mw.backBufferRTV.GetAddressOf(), nullptr);
     g_d3dContext->OMSetBlendState(g_opaqueBlend.Get(), blendFactor, 0xFFFFFFFF);
 
     GlyphInstance compositeInst{};
     compositeInst.destX = 0; compositeInst.destY = 0;
-    compositeInst.destW = static_cast<float>(g_width);
-    compositeInst.destH = static_cast<float>(g_height);
+    compositeInst.destW = static_cast<float>(mw.width);
+    compositeInst.destH = static_cast<float>(mw.height);
     compositeInst.u0 = compositeInst.v0 = 0.0f; compositeInst.u1 = compositeInst.v1 = 1.0f;
     compositeInst.colorR = compositeInst.colorG = compositeInst.colorB = compositeInst.colorA = 1.0f;
-    static std::vector<GlyphInstance> compositeScratch(1);
+    static thread_local std::vector<GlyphInstance> compositeScratch(1);
     compositeScratch[0] = compositeInst;
-    static LayerInstanceBuffer compositeBuf;
-    UploadInstances(compositeBuf, compositeScratch);
-    DrawInstanced(g_trailSRV.Get(), compositeBuf, 1);
+    UploadInstances(mw.compositeBuf, compositeScratch);
+    DrawInstanced(mw.trailSRV.Get(), mw.compositeBuf, 1);
 
-    DrawBenchmarkOverlay();
+    DrawBenchmarkOverlay(mw);
 
 #if UNCAP_FRAMERATE
     // Vsync disabled: renders as fast as the GPU can produce frames, ignoring
     // the monitor's refresh rate. Useful for measuring true max throughput,
     // but will spin the GPU at high power/thermal cost for no visual benefit
     // (frames faster than the display can show are simply discarded/torn).
-    HRESULT hr = g_swapChain->Present(0, 0);
+    HRESULT hr = mw.swapChain->Present(0, 0);
 #else
     // Vsync enabled: Present blocks until the next vblank, which paces the
-    // whole loop to the monitor's native refresh rate (e.g. 144Hz) with no
-    // tearing and minimal wasted GPU work.
-    HRESULT hr = g_swapChain->Present(1, 0);
+    // whole loop to this specific monitor's native refresh rate (e.g. 144Hz)
+    // with no tearing and minimal wasted GPU work. Each monitor's swapchain
+    // is presented independently, so mixed-refresh-rate setups (e.g. a 144Hz
+    // primary next to a 60Hz secondary) each pace correctly against their own
+    // display rather than being forced to a shared rate.
+    HRESULT hr = mw.swapChain->Present(1, 0);
 #endif
 #if ENABLE_BENCHMARK_OVERLAY
     if (FAILED(hr)) ++g_droppedPresentCount;
 #endif
 
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-        DiscardDeviceResources();
-        if (SUCCEEDED(InitDirect2D(g_hwnd))) {
-            InitColumns(g_width, g_height);
+        // Device loss affects every swapchain sharing the device, so the
+        // full shared pipeline plus every window's resources must be rebuilt
+        // together -- not just this one monitor's.
+        DiscardAllDeviceResources();
+        const wchar_t* failedStage = nullptr;
+        if (SUCCEEDED(InitSharedPipeline(&failedStage))) {
+            for (auto& other : g_monitorWindows) {
+                if (other && SUCCEEDED(InitMonitorWindow(*other))) {
+                    InitColumns(*other, other->width, other->height);
+                }
+            }
+            if (g_previewWindow && SUCCEEDED(InitMonitorWindow(*g_previewWindow))) {
+                InitColumns(*g_previewWindow, g_previewWindow->width, g_previewWindow->height);
+            }
         }
     }
 }
@@ -1522,27 +1544,125 @@ static void ResetMouseTracking(HWND hwnd) {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-monitor enumeration
+// ---------------------------------------------------------------------------
+// EnumDisplayMonitors callback: records each active display's virtual-desktop
+// geometry (which correctly handles negative coordinates for monitors placed
+// left-of/above the primary, and arbitrary width/height for mixed portrait/
+// landscape or mixed-resolution setups) plus its HMONITOR handle and
+// primary-monitor flag.
+static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC /*hdcMonitor*/, LPRECT /*lprcMonitor*/, LPARAM lParam) {
+    auto* outList = reinterpret_cast<std::vector<std::unique_ptr<MonitorWindow>>*>(lParam);
+
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hMonitor, &mi)) return TRUE; // skip this monitor, keep enumerating
+
+    auto mw = std::make_unique<MonitorWindow>();
+    mw->hMonitor = hMonitor;
+    // rcMonitor (not rcWork) is the *entire* physical display surface,
+    // including any taskbar area -- exactly what a borderless fullscreen
+    // screensaver window should cover. Coordinates are in virtual-desktop
+    // space, so a monitor to the left of the primary will have negative x.
+    mw->x = mi.rcMonitor.left;
+    mw->y = mi.rcMonitor.top;
+    mw->width = mi.rcMonitor.right - mi.rcMonitor.left;
+    mw->height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    mw->isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+
+    outList->push_back(std::move(mw));
+    return TRUE; // continue enumerating remaining monitors
+}
+
+// Populates g_monitorWindows with one MonitorWindow per active display,
+// using EnumDisplayMonitors to capture exact per-monitor geometry. Safe to
+// call multiple times (e.g. on WM_DISPLAYCHANGE) -- existing entries are
+// cleared first. Does not create any HWND/D3D resources; that happens
+// afterward in CreateAllMonitorWindows().
+static void EnumerateActiveMonitors(std::vector<std::unique_ptr<MonitorWindow>>& outList) {
+    outList.clear();
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&outList));
+
+    // Put the primary monitor first for a stable, predictable render order
+    // (mainly cosmetic -- e.g. so the primary shows the benchmark overlay
+    // first in any log output -- but also gives deterministic Z/topmost
+    // ordering among the windows we're about to create).
+    std::stable_sort(outList.begin(), outList.end(),
+        [](const std::unique_ptr<MonitorWindow>& a, const std::unique_ptr<MonitorWindow>& b) {
+            return a->isPrimary && !b->isPrimary;
+        });
+}
+
+// ---------------------------------------------------------------------------
 // Messaging System Window Pipelines
 // ---------------------------------------------------------------------------
+// A single WndProc serves every monitor's fullscreen HWND plus the preview
+// HWND. Each window's associated MonitorWindow* is stashed in GWLP_USERDATA
+// at WM_NCCREATE/WM_CREATE time (via CREATESTRUCT::lpCreateParams, which we
+// populate ourselves in CreateWindowExW's lpParam argument), so every
+// message can be routed to the right per-window state without any global
+// "current window" assumption.
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Stash the MonitorWindow* pointer (passed as CreateWindowExW's lpParam)
+    // into GWLP_USERDATA as soon as the window is created, so every
+    // subsequent message can retrieve it with GetWindowLongPtr.
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        // Set MonitorWindow::hwnd here, immediately, rather than waiting for
+        // CreateWindowExW to return. WS_VISIBLE windows dispatch WM_CREATE
+        // synchronously from inside CreateWindowExW, so anything done in
+        // WM_CREATE (including swap-chain creation, which needs a valid
+        // OutputWindow) would otherwise see a null mw->hwnd and fail with
+        // DXGI_ERROR_INVALID_CALL.
+        auto* earlyMw = reinterpret_cast<MonitorWindow*>(cs->lpCreateParams);
+        if (earlyMw) earlyMw->hwnd = hwnd;
+        // Fall through to DefWindowProc for the actual WM_NCCREATE handling.
+    }
+
+    MonitorWindow* mw = reinterpret_cast<MonitorWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
     switch (msg) {
     case WM_CREATE: {
+        if (!mw) return -1; // should never happen; abort window creation
+
         RECT rc;
         GetClientRect(hwnd, &rc);
-        g_width = rc.right - rc.left;
-        g_height = rc.bottom - rc.top;
+        mw->width = rc.right - rc.left;
+        mw->height = rc.bottom - rc.top;
 
-        SeedFastRng(static_cast<uint32_t>(time(nullptr)) ^ static_cast<uint32_t>(GetTickCount64()));
-        g_startTick = GetTickCount64();
+        // The shared device/shader/atlas pipeline (plus process-global
+        // facilities like the PDH performance counters, which must only be
+        // opened once regardless of how many monitor windows exist) is
+        // initialized exactly once, the first time any window is created
+        // (fullscreen monitor window or preview). Subsequent windows only
+        // need their own swapchain and per-window resources against the
+        // already-live device.
+        static bool s_sharedPipelineReady = false;
+        if (!s_sharedPipelineReady) {
+            SeedFastRng(static_cast<uint32_t>(time(nullptr)) ^ static_cast<uint32_t>(GetTickCount64()));
+            g_startTick = GetTickCount64();
+
+            const wchar_t* failedStage = L"(unknown)";
+            HRESULT initHr = InitSharedPipeline(&failedStage);
+            if (FAILED(initHr)) {
+                wchar_t buf[192];
+                swprintf_s(buf, L"Direct3D11 shared pipeline initialization failed.\nStage: %s\nHRESULT: 0x%08X",
+                    failedStage, static_cast<unsigned int>(initHr));
+                MessageBoxW(hwnd, buf, L"Matrix Screensaver", MB_OK | MB_ICONERROR);
+                return -1;
+            }
+            InitPerfCounters();
+            s_sharedPipelineReady = true;
+        }
 
         const wchar_t* failedStage = L"(unknown)";
-        HRESULT initHr = InitDirect2D(hwnd, &failedStage);
+        HRESULT initHr = InitMonitorWindow(*mw, &failedStage);
         if (FAILED(initHr)) {
-            wchar_t msg[192];
-            swprintf_s(msg, L"Direct2D/D3D11 initialization failed.\nStage: %s\nHRESULT: 0x%08X", failedStage, static_cast<unsigned int>(initHr));
-            MessageBoxW(hwnd, msg, L"Matrix Screensaver", MB_OK | MB_ICONERROR);
-            DestroyWindow(hwnd);
-            return 0;
+            wchar_t buf[192];
+            swprintf_s(buf, L"Direct3D11 window initialization failed.\nStage: %s\nHRESULT: 0x%08X", failedStage, static_cast<unsigned int>(initHr));
+            MessageBoxW(hwnd, buf, L"Matrix Screensaver", MB_OK | MB_ICONERROR);
+            return -1;
         }
 
         InitColumns(*mw, mw->width, mw->height);
@@ -1554,20 +1674,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // The small embedded preview window (screensaver picker thumbnail) has
         // no reason to render at full monitor refresh rate -- it's tiny and
         // usually not even visible for long. Keep it on a modest timer so it
-        // doesn't compete for GPU/CPU with whatever else is running. The
-        // fullscreen case is driven by the main PeekMessage loop in wWinMain
-        // instead, paced by Present()'s vsync wait, so no timer is needed there.
+        // doesn't compete for GPU/CPU with whatever else is running. Fullscreen
+        // monitor windows are instead driven by the main PeekMessage loop in
+        // wWinMain, paced by each window's own Present()'s vsync wait, so no
+        // timer is needed there.
         if (g_isPreview) {
             SetTimer(hwnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
         }
         return 0;
     }
     case WM_TIMER: {
-        if (g_isVisible) DrawFrame(static_cast<DWORD>(GetTickCount64()));
+        if (mw && mw->isVisible) DrawFrame(*mw, static_cast<DWORD>(GetTickCount64()));
         return 0;
     }
     case WM_SHOWWINDOW: {
-        g_isVisible = (wParam != 0);
+        if (mw) mw->isVisible = (wParam != 0);
         return 0;
     }
     case WM_PAINT: {
@@ -1577,8 +1698,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_SIZE: {
-        g_isVisible = (wParam != SIZE_MINIMIZED);
-        if (g_swapChain) {
+        if (!mw) break;
+        mw->isVisible = (wParam != SIZE_MINIMIZED);
+        if (mw->swapChain) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             int newWidth = rc.right - rc.left;
@@ -1586,31 +1708,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (newWidth < 1) newWidth = 1;
             if (newHeight < 1) newHeight = 1;
 
-            if (newWidth != g_width || newHeight != g_height) {
-                g_width = newWidth;
-                g_height = newHeight;
+            if (newWidth != mw->width || newHeight != mw->height) {
+                mw->width = newWidth;
+                mw->height = newHeight;
 
                 g_d3dContext->OMSetRenderTargets(0, nullptr, nullptr);
-                g_backBufferRTV.Reset();
-                g_trailRTV.Reset();
-                g_trailSRV.Reset();
-                g_trailTexture.Reset();
+                mw->backBufferRTV.Reset();
+                mw->trailRTV.Reset();
+                mw->trailSRV.Reset();
+                mw->trailTexture.Reset();
+#if ENABLE_BENCHMARK_OVERLAY
+                mw->overlayD2DTarget.Reset();
+#endif
 
-                HRESULT hr = g_swapChain->ResizeBuffers(0, static_cast<UINT>(g_width),
-                    static_cast<UINT>(g_height), DXGI_FORMAT_UNKNOWN, 0);
+                HRESULT hr = mw->swapChain->ResizeBuffers(0, static_cast<UINT>(mw->width),
+                    static_cast<UINT>(mw->height), DXGI_FORMAT_UNKNOWN, 0);
                 if (SUCCEEDED(hr)) {
-                    hr = CreateSizeDependentResources(g_width, g_height);
+                    hr = CreateSizeDependentResources(*mw, mw->width, mw->height);
                 }
 
                 if (FAILED(hr)) {
-                    DiscardDeviceResources();
-                    if (SUCCEEDED(InitDirect2D(hwnd))) {
-                        InitColumns(g_width, g_height);
+                    // Resize failed (e.g. device lost mid-resize): rebuild
+                    // this window's resources against the existing shared
+                    // device. If the device itself is gone, DrawFrame's own
+                    // DXGI_ERROR_DEVICE_REMOVED/RESET handling will catch it
+                    // on the next frame and rebuild everything.
+                    DiscardWindowResources(*mw);
+                    if (SUCCEEDED(InitMonitorWindow(*mw))) {
+                        InitColumns(*mw, mw->width, mw->height);
                     }
                     return 0;
                 }
 
-                InitColumns(g_width, g_height);
+                InitColumns(*mw, mw->width, mw->height);
             }
         }
         return 0;
@@ -1632,14 +1762,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         POINT p;
         GetCursorPos(&p);
         if (std::abs(p.x - g_lastMousePos.x) > MOVE_THRESHOLD || std::abs(p.y - g_lastMousePos.y) > MOVE_THRESHOLD) {
-            DestroyWindow(hwnd);
+            // Any monitor's window exiting on mouse movement should end the
+            // whole multi-monitor screensaver session, not just that one
+            // window -- otherwise the user could be left with N-1 fullscreen
+            // black windows still covering their other monitors. Destroying
+            // every window here causes each to individually hit WM_DESTROY
+            // and PostQuitMessage, which is harmless (PostQuitMessage can be
+            // called multiple times; the loop exits on the first WM_QUIT it
+            // sees).
+            for (auto& other : g_monitorWindows) {
+                if (other && other->hwnd && IsWindow(other->hwnd)) DestroyWindow(other->hwnd);
+            }
         }
         return 0;
     }
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
-        if (!g_isPreview && !InGracePeriod()) DestroyWindow(hwnd);
+        if (!g_isPreview && !InGracePeriod()) {
+            for (auto& other : g_monitorWindows) {
+                if (other && other->hwnd && IsWindow(other->hwnd)) DestroyWindow(other->hwnd);
+            }
+        }
         return 0;
 
     case WM_KEYDOWN:
@@ -1654,26 +1798,71 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 #endif
-        if (!g_isPreview && !InGracePeriod()) DestroyWindow(hwnd);
+        if (!g_isPreview && !InGracePeriod()) {
+            for (auto& other : g_monitorWindows) {
+                if (other && other->hwnd && IsWindow(other->hwnd)) DestroyWindow(other->hwnd);
+            }
+        }
         return 0;
 
     case WM_ACTIVATE:
-        if (!g_isPreview && !InGracePeriod() && LOWORD(wParam) == WA_INACTIVE) DestroyWindow(hwnd);
+        // Only the specific window that lost activation should trigger
+        // exit-on-deactivate; with several topmost fullscreen windows,
+        // clicking from one monitor to another would otherwise immediately
+        // tear down the whole session as soon as focus moved between them.
+        // Real user-initiated deactivation (Alt+Tab away, another app
+        // stealing focus) still exits normally via this same path.
+        if (!g_isPreview && !InGracePeriod() && LOWORD(wParam) == WA_INACTIVE) {
+            HWND newFocus = reinterpret_cast<HWND>(lParam);
+            bool activatingAnotherMonitorWindow = false;
+            for (auto& other : g_monitorWindows) {
+                if (other && other->hwnd == newFocus) { activatingAnotherMonitorWindow = true; break; }
+            }
+            if (!activatingAnotherMonitorWindow) {
+                for (auto& other : g_monitorWindows) {
+                    if (other && other->hwnd && IsWindow(other->hwnd)) DestroyWindow(other->hwnd);
+                }
+            }
+        }
         return 0;
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
         if (!g_isPreview) ShowCursor(TRUE);
-        ShutdownPerfCounters();
-        DiscardDeviceResources();
-        g_matrixFontLoader.Unload(); // RemoveFontMemResourceEx
+        if (mw) {
+            DiscardWindowResources(*mw);
+        }
+        // Only tear down the shared device/pipeline and process-global
+        // facilities (PDH perf counters) once every monitor window (and the
+        // preview window, if any) has been destroyed -- per-window
+        // WM_DESTROY must not kill resources other windows still depend on.
+        // g_liveWindowCount is incremented once per successful WM_CREATE, so
+        // it reaches zero exactly when the last live window goes away.
+        // wWinMain also calls DiscardSharedDeviceResources() itself after the
+        // message loop exits as a safety net; that call is idempotent.
+        if (--g_liveWindowCount <= 0) {
+            ShutdownPerfCounters();
+        }
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-static HWND CreateFullscreenWindow(HINSTANCE hInstance) {
+// Creates one borderless, topmost, fullscreen HWND per entry already
+// populated in g_monitorWindows (see EnumerateActiveMonitors), positioned
+// and sized to exactly match that monitor's virtual-desktop rectangle. This
+// correctly handles asymmetrical setups -- differing resolutions, portrait/
+// landscape mixes, and monitors offset to the left of/above the primary
+// (negative coordinates) -- because it uses each MonitorWindow's own x/y/
+// width/height rather than any single GetSystemMetrics(SM_CXSCREEN)-style
+// primary-only value.
+//
+// Returns true only if every monitor window was created successfully; on
+// partial failure, any windows already created are left intact (destroying
+// them here would be premature since the caller may choose to continue with
+// a reduced set), but the caller should treat an overall false as fatal.
+static bool CreateAllMonitorWindows(HINSTANCE hInstance) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
@@ -1682,14 +1871,26 @@ static HWND CreateFullscreenWindow(HINSTANCE hInstance) {
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST, wc.lpszClassName, L"Matrix Screensaver",
-        WS_POPUP | WS_VISIBLE, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
-        nullptr, nullptr, hInstance, nullptr);
-    return hwnd;
+    for (auto& mwPtr : g_monitorWindows) {
+        MonitorWindow* mw = mwPtr.get();
+
+        // lpCreateParams (final argument) is retrieved inside WndProc's
+        // WM_NCCREATE handler and stashed into GWLP_USERDATA, which is how
+        // this single shared WndProc tells which MonitorWindow a given HWND
+        // belongs to for every later message.
+        HWND hwnd = CreateWindowExW(
+            WS_EX_TOPMOST, wc.lpszClassName, L"Matrix Screensaver",
+            WS_POPUP | WS_VISIBLE,
+            mw->x, mw->y, mw->width, mw->height,
+            nullptr, nullptr, hInstance, mw);
+
+        if (!hwnd) return false;
+        mw->hwnd = hwnd;
+    }
+    return true;
 }
 
-static HWND CreatePreviewWindow(HINSTANCE hInstance, HWND parent) {
+static HWND CreatePreviewWindow(HINSTANCE hInstance, HWND parent, MonitorWindow* mw) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
@@ -1700,7 +1901,7 @@ static HWND CreatePreviewWindow(HINSTANCE hInstance, HWND parent) {
     RECT rc;
     GetClientRect(parent, &rc);
     return CreateWindowExW(0, wc.lpszClassName, L"", WS_CHILD | WS_VISIBLE,
-        0, 0, rc.right - rc.left, rc.bottom - rc.top, parent, nullptr, hInstance, nullptr);
+        0, 0, rc.right - rc.left, rc.bottom - rc.top, parent, nullptr, hInstance, mw);
 }
 
 static void ShowConfigDialog(HINSTANCE hInstance, HWND ownerHwnd) {
@@ -1784,25 +1985,64 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     if (isPreview && targetParent && IsWindow(targetParent)) {
         g_isPreview = true;
-        g_hwnd = CreatePreviewWindow(hInstance, targetParent);
+        g_previewWindow = std::make_unique<MonitorWindow>();
+        HWND previewHwnd = CreatePreviewWindow(hInstance, targetParent, g_previewWindow.get());
+        if (!previewHwnd) return 0;
+        g_previewWindow->hwnd = previewHwnd;
+
+        ShowWindow(previewHwnd, SW_SHOW);
+        UpdateWindow(previewHwnd);
+
+        // Preview mode is driven entirely by its own WM_TIMER (set up in
+        // WM_CREATE), so this just needs a standard blocking message pump.
+        MSG msg{};
+        while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        DiscardSharedDeviceResources();
+        return static_cast<int>(msg.wParam);
     }
-    else {
-        g_isPreview = false;
-        g_hwnd = CreateFullscreenWindow(hInstance);
+
+    // Full multi-monitor fullscreen mode: enumerate every active display via
+    // EnumDisplayMonitors, then create one independent borderless fullscreen
+    // window per monitor, each sized/positioned to that monitor's exact
+    // virtual-desktop rectangle (correctly handling negative offsets,
+    // mismatched resolutions, and portrait/landscape mixes).
+    g_isPreview = false;
+    EnumerateActiveMonitors(g_monitorWindows);
+
+    if (g_monitorWindows.empty()) {
+        // Should be unreachable on any real system (there's always at least
+        // one display), but fall back to treating it as a single-monitor
+        // failure rather than silently doing nothing.
+        MessageBoxW(nullptr, L"No active displays were detected.", L"Matrix Screensaver", MB_OK | MB_ICONERROR);
+        return 0;
     }
 
-    if (!g_hwnd) return 0;
+    if (!CreateAllMonitorWindows(hInstance)) {
+        MessageBoxW(nullptr, L"Failed to create one or more monitor windows.", L"Matrix Screensaver", MB_OK | MB_ICONERROR);
+        // Tear down anything already created via each HWND's own WM_DESTROY.
+        for (auto& mwPtr : g_monitorWindows) {
+            if (mwPtr && mwPtr->hwnd) DestroyWindow(mwPtr->hwnd);
+        }
+        return 0;
+    }
 
-    ShowWindow(g_hwnd, SW_SHOW);
-    UpdateWindow(g_hwnd);
+    for (auto& mwPtr : g_monitorWindows) {
+        ShowWindow(mwPtr->hwnd, SW_SHOW);
+        UpdateWindow(mwPtr->hwnd);
+    }
 
-    // Fullscreen mode: drain all pending Windows messages without blocking,
-    // then render one frame. Present(1,0) (vsync on) blocks inside DrawFrame
-    // until the next vblank, which is what actually paces this loop to the
-    // monitor's refresh rate (e.g. 144Hz) -- there is no Sleep()/timer needed.
-    // The preview window (small embedded thumbnail, g_isPreview == true) is
-    // still driven by its own WM_TIMER set up in WM_CREATE, so this loop just
-    // pumps its messages normally without an extra render call for it.
+    // Multi-monitor render loop: drain all pending Windows messages (across
+    // every monitor window) without blocking, then render+present one frame
+    // on each visible monitor window in turn. Each window's own
+    // IDXGISwapChain::Present(1,0) call (vsync on) blocks until that specific
+    // monitor's next vblank, so a mixed-refresh-rate setup (e.g. 144Hz
+    // primary + 60Hz secondary) naturally paces each swapchain against its
+    // own display rather than forcing a single shared rate. The loop as a
+    // whole is gated by the slowest visible monitor in any given pass, which
+    // is the same trade-off any multi-head fullscreen D3D11 app makes.
     MSG msg{};
     bool running = true;
     while (running) {
@@ -1816,15 +2056,27 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         }
         if (!running) break;
 
-        if (!g_isPreview && g_isVisible) {
-            DrawFrame(static_cast<DWORD>(GetTickCount64()));
+        bool anyVisible = false;
+        for (auto& mwPtr : g_monitorWindows) {
+            if (mwPtr && mwPtr->isVisible) {
+                DrawFrame(*mwPtr, static_cast<DWORD>(GetTickCount64()));
+                anyVisible = true;
+            }
         }
-        else {
-            // Nothing to render right now (preview window renders via its own
-            // timer; fullscreen window is hidden/minimized) -- avoid a hot
-            // spin loop burning a CPU core for no reason.
+        if (!anyVisible) {
+            // Nothing to render right now (all monitor windows hidden or
+            // minimized) -- avoid a hot spin loop burning a CPU core for no
+            // reason.
             WaitMessage();
         }
     }
+
+    // The message loop only exits once every monitor window has posted
+    // WM_QUIT via its own WM_DESTROY (each window's WM_DESTROY handler tears
+    // down just that window's own resources). Now that all windows are gone,
+    // it's safe to release the shared device/pipeline/atlases.
+    DiscardSharedDeviceResources();
+    g_monitorWindows.clear();
+
     return static_cast<int>(msg.wParam);
 }
