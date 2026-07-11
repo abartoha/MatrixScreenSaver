@@ -44,10 +44,16 @@
 // ---------------------------------------------------------------------------
 // Build-time switches
 // ---------------------------------------------------------------------------
-// Set to 0 to fully compile out the benchmark/diagnostics overlay and all its
-// bookkeeping (PDH queries, DXGI memory queries, frame-time history, HUD
-// drawing). Set to 1 to include it (still toggleable at runtime with the 'B'
-// key when enabled here).
+// Set to 0 to fully compile out the benchmark/diagnostics system and all its
+// bookkeeping (PDH queries, DXGI memory/usage queries, frame-time history,
+// sparkline graphs, HUD drawing). Set to 1 to include it.
+//
+// When enabled, benchmark DATA COLLECTION always runs in the background from
+// startup (frame timing, CPU/RAM, GPU usage %, GPU VRAM), regardless of
+// whether the HUD is currently shown -- only the on-screen panel itself is
+// toggled by the 'B' key at runtime. This means pressing 'B' at any point
+// during the session immediately shows a fully populated history/graphs
+// rather than an empty panel that needs time to warm up.
 #define ENABLE_BENCHMARK_OVERLAY 1
 
 // Set to 1 to disable vsync (Present(0,0)) and let the render loop run as fast
@@ -244,10 +250,15 @@ static bool  g_mouseInit = false;
 // Benchmark / Diagnostics Overlay
 // ---------------------------------------------------------------------------
 #if ENABLE_BENCHMARK_OVERLAY
-// Toggle overlay with the "B" key (does not exit the screensaver, since normal
-// key input already exits; the toggle is handled specially in WndProc before
-// the exit-on-keypress logic runs).
-static bool g_benchEnabled = true;
+// Toggle overlay VISIBILITY with the "B" key (does not exit the screensaver,
+// since normal key input already exits; the toggle is handled specially in
+// WndProc before the exit-on-keypress logic runs).
+//
+// IMPORTANT: g_benchEnabled controls DISPLAY only. All stats collection
+// (frame timing, CPU/mem/GPU sampling, sparkline history) runs unconditionally
+// every frame regardless of this flag, so the instant 'B' is pressed the
+// overlay appears already full of live history instead of starting cold.
+static bool g_benchEnabled = false;
 
 struct AdapterInfo {
     std::wstring description;
@@ -264,6 +275,29 @@ static std::vector<AdapterInfo> g_allAdapters;
 static AdapterInfo              g_chosenAdapter;
 static std::wstring             g_adapterSelectionNote;
 
+// ---- Sparkline ring buffer -------------------------------------------------
+// Small fixed-capacity rolling history backing the mini line-graphs drawn in
+// the overlay. Generic so the same drawing code can render FPS, frame-time,
+// CPU%, and GPU% history alike.
+struct Sparkline {
+    std::deque<float> samples;
+    size_t capacity = 120; // ~60s of history at the 500ms stats-refresh cadence
+
+    void push(float v) {
+        samples.push_back(v);
+        while (samples.size() > capacity) samples.pop_front();
+    }
+    float latest() const { return samples.empty() ? 0.0f : samples.back(); }
+    float minVal() const { return samples.empty() ? 0.0f : *std::min_element(samples.begin(), samples.end()); }
+    float maxVal() const { return samples.empty() ? 0.0f : *std::max_element(samples.begin(), samples.end()); }
+    float avgVal() const {
+        if (samples.empty()) return 0.0f;
+        float sum = 0.0f;
+        for (float v : samples) sum += v;
+        return sum / static_cast<float>(samples.size());
+    }
+};
+
 // Frame timing
 static LARGE_INTEGER g_qpcFrequency{};
 static LARGE_INTEGER g_lastFrameQpc{};
@@ -277,6 +311,15 @@ static double g_p99FrameMs = 0.0;
 static UINT64 g_totalFramesRendered = 0;
 static UINT64 g_droppedPresentCount = 0; // Present() calls that returned an error
 
+// Sparkline histories (sampled once per stats-refresh tick -- decoupled from
+// raw per-frame noise so the graphs read as a trend rather than jitter).
+static Sparkline g_fpsSpark;
+static Sparkline g_frameMsSpark;
+static Sparkline g_processCpuSpark;
+static Sparkline g_systemCpuSpark;
+static Sparkline g_gpuUsageSpark;
+static Sparkline g_gpuVramPctSpark;
+
 // CPU usage (process vs total system) via PDH
 static PDH_HQUERY   g_pdhQuery = nullptr;
 static PDH_HCOUNTER g_pdhProcessCpuCounter = nullptr;
@@ -284,6 +327,19 @@ static PDH_HCOUNTER g_pdhTotalCpuCounter = nullptr;
 static double g_processCpuPercent = 0.0;
 static double g_systemCpuPercent = 0.0;
 static int    g_logicalCoreCount = 1;
+
+// GPU usage percentage via PDH "GPU Engine" counters -- the same mechanism
+// Task Manager's per-process GPU column uses. These counter *instances* are
+// dynamic (they appear/disappear as engines are used), so unlike the CPU
+// counters we can't add them once at startup: we periodically re-enumerate
+// "\GPU Engine(*)\Utilization Percentage" instances belonging to our own PID
+// and sum utilization across all of them (3D, copy, video decode engines, etc).
+static PDH_HQUERY g_pdhGpuQuery = nullptr;
+static std::vector<PDH_HCOUNTER> g_pdhGpuUtilCounters;
+static ULONGLONG g_lastGpuCounterEnumTick = 0;
+static const ULONGLONG GPU_COUNTER_REENUM_INTERVAL_MS = 2000;
+static double g_gpuUsagePercent = 0.0;
+static bool   g_gpuUsageAvailable = false;
 
 // Memory usage
 static SIZE_T g_processWorkingSetBytes = 0;
@@ -297,17 +353,24 @@ static SIZE_T g_gpuVideoMemUsedBytes = 0;
 static SIZE_T g_gpuVideoMemBudgetBytes = 0;
 static ComPtr<IDXGIAdapter3> g_dxgiAdapter3; // optional, for QueryVideoMemoryInfo
 
-// Diagnostics refresh cadence: don't hammer PDH/DXGI budget queries every frame
+// Diagnostics refresh cadence: don't hammer PDH/DXGI budget queries every frame.
+// This cadence now ALSO drives the sparkline sample rate, and runs
+// unconditionally (not gated on g_benchEnabled) -- see note above.
 static ULONGLONG g_lastStatsRefreshTick = 0;
 static const ULONGLONG STATS_REFRESH_INTERVAL_MS = 500;
 
-// D2D text resources for the overlay (created alongside other size-dependent resources).
-// The overlay D2D *bitmap target* is per-window (see MonitorWindow::overlayD2DTarget)
-// since it's a view onto that window's specific backbuffer surface; the text
-// format and brushes here are monitor-independent and stay shared.
+// D2D text/graph resources for the overlay (created alongside other
+// size-dependent resources). The overlay D2D *bitmap target* is per-window
+// (see MonitorWindow::overlayD2DTarget) since it's a view onto that window's
+// specific backbuffer surface; everything here is monitor-independent and shared.
 static ComPtr<IDWriteTextFormat>    g_overlayTextFormat;
+static ComPtr<IDWriteTextFormat>    g_overlayLabelFormat;  // smaller font for graph captions
 static ComPtr<ID2D1SolidColorBrush> g_overlayTextBrush;
 static ComPtr<ID2D1SolidColorBrush> g_overlayBgBrush;
+static ComPtr<ID2D1SolidColorBrush> g_overlayGraphLineBrush;
+static ComPtr<ID2D1SolidColorBrush> g_overlayGraphFillBrush;
+static ComPtr<ID2D1SolidColorBrush> g_overlayGraphWarnBrush;
+static ComPtr<ID2D1SolidColorBrush> g_overlayGraphBgBrush;
 #endif // ENABLE_BENCHMARK_OVERLAY
 
 // Real-time frame pacing (always needed, independent of the benchmark overlay,
@@ -649,6 +712,84 @@ static void InitPerfCounters() {
     PdhCollectQueryData(g_pdhQuery); // prime the query; first formatted read needs two samples
 }
 
+static void ShutdownGpuUsageQuery() {
+    if (g_pdhGpuQuery) {
+        PdhCloseQuery(g_pdhGpuQuery); // also frees all counters added to it
+        g_pdhGpuQuery = nullptr;
+    }
+    g_pdhGpuUtilCounters.clear();
+    g_gpuUsageAvailable = false;
+}
+
+// (Re)enumerates "\GPU Engine(*)\Utilization Percentage" instances and keeps
+// only the ones whose instance name embeds our own PID (instance names look
+// like "pid_1234_luid_0x...._phys_0_eng_0_engtype_3D"). Re-run periodically
+// since Windows creates/destroys these instances dynamically as GPU engines
+// are opened/closed by the driver.
+static void RefreshGpuUsageCounterList() {
+    ShutdownGpuUsageQuery();
+    if (PdhOpenQueryW(nullptr, 0, &g_pdhGpuQuery) != ERROR_SUCCESS) {
+        g_pdhGpuQuery = nullptr;
+        return;
+    }
+
+    DWORD pid = GetCurrentProcessId();
+    wchar_t pidTag[32];
+    swprintf_s(pidTag, L"pid_%u_", pid);
+
+    // Query the counter path's available instance list.
+    DWORD counterListSize = 0, instanceListSize = 0;
+    PdhEnumObjectItemsW(nullptr, nullptr, L"GPU Engine", nullptr, &counterListSize,
+        nullptr, &instanceListSize, PERF_DETAIL_WIZARD, 0);
+    if (instanceListSize == 0) return; // "GPU Engine" perf object not present on this system
+
+    std::vector<wchar_t> counterListBuf(counterListSize > 0 ? counterListSize : 1);
+    std::vector<wchar_t> instanceListBuf(instanceListSize);
+    if (PdhEnumObjectItemsW(nullptr, nullptr, L"GPU Engine",
+        counterListBuf.data(), &counterListSize,
+        instanceListBuf.data(), &instanceListSize,
+        PERF_DETAIL_WIZARD, 0) != ERROR_SUCCESS) {
+        return;
+    }
+
+    // instanceListBuf is a MULTI_SZ: consecutive NUL-terminated strings, ending
+    // in a double NUL.
+    for (const wchar_t* p = instanceListBuf.data(); *p != L'\0'; p += wcslen(p) + 1) {
+        std::wstring instance = p;
+        if (instance.find(pidTag) == std::wstring::npos) continue; // not our process
+
+        wchar_t path[512];
+        swprintf_s(path, L"\\GPU Engine(%s)\\Utilization Percentage", instance.c_str());
+        PDH_HCOUNTER counter = nullptr;
+        if (PdhAddCounterW(g_pdhGpuQuery, path, 0, &counter) == ERROR_SUCCESS) {
+            g_pdhGpuUtilCounters.push_back(counter);
+        }
+    }
+
+    if (!g_pdhGpuUtilCounters.empty()) {
+        PdhCollectQueryData(g_pdhGpuQuery); // prime; first formatted read needs two samples
+        g_gpuUsageAvailable = true;
+    }
+}
+
+static void RefreshGpuUsagePercent() {
+    if (!g_pdhGpuQuery || g_pdhGpuUtilCounters.empty()) { g_gpuUsagePercent = 0.0; return; }
+    if (PdhCollectQueryData(g_pdhGpuQuery) != ERROR_SUCCESS) return;
+
+    double total = 0.0;
+    for (PDH_HCOUNTER c : g_pdhGpuUtilCounters) {
+        PDH_FMT_COUNTERVALUE val{};
+        if (PdhGetFormattedCounterValue(c, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS) {
+            total += val.doubleValue;
+        }
+    }
+    // Multiple engines can each report up to 100%; a single "3D" engine is
+    // usually what a screensaver drives, but clamp defensively in case the
+    // driver reports overlapping/duplicate engine instances.
+    if (total > 100.0) total = 100.0;
+    g_gpuUsagePercent = total;
+}
+
 static void ShutdownPerfCounters() {
     if (g_pdhQuery) {
         PdhCloseQuery(g_pdhQuery);
@@ -656,6 +797,7 @@ static void ShutdownPerfCounters() {
         g_pdhProcessCpuCounter = nullptr;
         g_pdhTotalCpuCounter = nullptr;
     }
+    ShutdownGpuUsageQuery();
 }
 
 static void RefreshCpuAndMemoryStats() {
@@ -689,6 +831,28 @@ static void RefreshCpuAndMemoryStats() {
     }
 
     RefreshGpuMemoryUsage();
+
+    // GPU Engine counter instances come and go, so periodically re-scan for
+    // ones tagged with our PID rather than assuming a fixed set forever.
+    ULONGLONG nowTick = GetTickCount64();
+    if (!g_pdhGpuQuery || (nowTick - g_lastGpuCounterEnumTick) >= GPU_COUNTER_REENUM_INTERVAL_MS) {
+        RefreshGpuUsageCounterList();
+        g_lastGpuCounterEnumTick = nowTick;
+    }
+    RefreshGpuUsagePercent();
+
+    // Sample the sparkline histories at this same throttled cadence (roughly
+    // every STATS_REFRESH_INTERVAL_MS) so the graphs show a readable trend
+    // rather than raw per-frame noise.
+    g_fpsSpark.push(static_cast<float>(g_currentFps));
+    g_frameMsSpark.push(static_cast<float>(g_avgFrameMs));
+    g_processCpuSpark.push(static_cast<float>(g_processCpuPercent));
+    g_systemCpuSpark.push(static_cast<float>(g_systemCpuPercent));
+    g_gpuUsageSpark.push(static_cast<float>(g_gpuUsagePercent));
+    double vramPct = (g_gpuVideoMemBudgetBytes > 0)
+        ? (100.0 * static_cast<double>(g_gpuVideoMemUsedBytes) / static_cast<double>(g_gpuVideoMemBudgetBytes))
+        : 0.0;
+    g_gpuVramPctSpark.push(static_cast<float>(vramPct));
 }
 #else
 // No-op stubs so call sites don't need scattered #ifdefs when the overlay is
@@ -974,10 +1138,32 @@ static HRESULT CreateOverlayResources() {
     if (FAILED(hr)) return hr;
     g_overlayTextFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
+    hr = g_dwriteFactory->CreateTextFormat(
+        L"Consolas", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-us", &g_overlayLabelFormat);
+    if (FAILED(hr)) return hr;
+    g_overlayLabelFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
     hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.35f, 1.0f, 0.45f, 1.0f), &g_overlayTextBrush);
     if (FAILED(hr)) return hr;
 
     hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f), &g_overlayBgBrush);
+    if (FAILED(hr)) return hr;
+
+    // Sparkline graph palette: bright green line + translucent fill under the
+    // curve (matches the Matrix theme), amber for warning thresholds, and a
+    // slightly-darker-than-panel backing rect so each graph reads as its own
+    // widget within the HUD.
+    hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.4f, 1.0f, 0.5f, 0.95f), &g_overlayGraphLineBrush);
+    if (FAILED(hr)) return hr;
+
+    hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.4f, 1.0f, 0.5f, 0.18f), &g_overlayGraphFillBrush);
+    if (FAILED(hr)) return hr;
+
+    hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.75f, 0.2f, 0.95f), &g_overlayGraphWarnBrush);
+    if (FAILED(hr)) return hr;
+
+    hr = g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.30f), &g_overlayGraphBgBrush);
     return hr;
 }
 #else
@@ -1106,8 +1292,13 @@ static void DiscardSharedDeviceResources() {
     }
 #if ENABLE_BENCHMARK_OVERLAY
     g_overlayTextFormat.Reset();
+    g_overlayLabelFormat.Reset();
     g_overlayTextBrush.Reset();
     g_overlayBgBrush.Reset();
+    g_overlayGraphLineBrush.Reset();
+    g_overlayGraphFillBrush.Reset();
+    g_overlayGraphWarnBrush.Reset();
+    g_overlayGraphBgBrush.Reset();
     g_dxgiAdapter3.Reset();
 #endif
     g_d2dContext.Reset();
@@ -1287,49 +1478,187 @@ static std::wstring FormatBytesMB(SIZE_T bytes) {
     return buf;
 }
 
+// Draws one sparkline graph widget: a labeled mini line-chart with a filled
+// area under the curve, a current-value readout, and min/avg/max caption.
+// `rangeMax` is the fixed scale ceiling to plot against (e.g. 100.0 for a
+// percentage, or 0.0 to auto-scale to the series' own max -- used for FPS and
+// frame-time where there's no natural fixed ceiling). `warnThreshold`: values
+// at or above this fraction of rangeMax (0..1, ignored when <= 0) draw the
+// line/fill in the amber "warn" brush instead of the normal green, and the
+// latest-value readout switches to amber too -- a quick visual flag for e.g.
+// near-VRAM-budget or CPU pegged at 100%.
+static void DrawSparklineWidget(const D2D1_RECT_F& rect, const wchar_t* label, const Sparkline& spark,
+    const wchar_t* unitSuffix, float rangeMax, float warnThreshold) {
+    if (!g_d2dContext || !g_overlayLabelFormat || !g_overlayTextFormat) return;
+
+    g_d2dContext->FillRectangle(rect, g_overlayGraphBgBrush.Get());
+
+    const float labelH = 14.0f;
+    D2D1_RECT_F labelRect = D2D1::RectF(rect.left + 4.0f, rect.top + 2.0f, rect.right - 4.0f, rect.top + labelH);
+    g_d2dContext->DrawTextW(label, static_cast<UINT32>(wcslen(label)), g_overlayLabelFormat.Get(),
+        labelRect, g_overlayTextBrush.Get());
+
+    // Current-value readout, right-aligned in the label row.
+    wchar_t valBuf[64];
+    float latest = spark.latest();
+    swprintf_s(valBuf, L"%.1f%s", latest, unitSuffix);
+    bool warn = (warnThreshold > 0.0f) && (rangeMax > 0.0f) && (latest >= warnThreshold * rangeMax);
+    ID2D1SolidColorBrush* valBrush = warn ? g_overlayGraphWarnBrush.Get() : g_overlayTextBrush.Get();
+    g_overlayLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    g_d2dContext->DrawTextW(valBuf, static_cast<UINT32>(wcslen(valBuf)), g_overlayLabelFormat.Get(),
+        labelRect, valBrush);
+    g_overlayLabelFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    // Plot area sits beneath the label row.
+    D2D1_RECT_F plotRect = D2D1::RectF(rect.left + 2.0f, rect.top + labelH + 2.0f, rect.right - 2.0f, rect.bottom - 14.0f);
+    float plotW = plotRect.right - plotRect.left;
+    float plotH = plotRect.bottom - plotRect.top;
+    if (plotW > 1.0f && plotH > 1.0f && spark.samples.size() >= 2) {
+        float scaleMax = rangeMax > 0.0f ? rangeMax : (std::max)(spark.maxVal(), 0.001f);
+        size_t n = spark.samples.size();
+
+        ComPtr<ID2D1PathGeometry> lineGeo, fillGeo;
+        g_d2dFactory->CreatePathGeometry(&lineGeo);
+        g_d2dFactory->CreatePathGeometry(&fillGeo);
+
+        auto pointFor = [&](size_t i) -> D2D1_POINT_2F {
+            float x = plotRect.left + plotW * (static_cast<float>(i) / static_cast<float>(n - 1));
+            float v = spark.samples[i];
+            float t = (std::min)(1.0f, (std::max)(0.0f, v / scaleMax));
+            float y = plotRect.bottom - t * plotH;
+            return D2D1::Point2F(x, y);
+        };
+
+        if (lineGeo) {
+            ComPtr<ID2D1GeometrySink> sink;
+            lineGeo->Open(&sink);
+            sink->BeginFigure(pointFor(0), D2D1_FIGURE_BEGIN_HOLLOW);
+            for (size_t i = 1; i < n; ++i) sink->AddLine(pointFor(i));
+            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            sink->Close();
+        }
+        if (fillGeo) {
+            ComPtr<ID2D1GeometrySink> sink;
+            fillGeo->Open(&sink);
+            sink->BeginFigure(D2D1::Point2F(plotRect.left, plotRect.bottom), D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine(pointFor(0));
+            for (size_t i = 1; i < n; ++i) sink->AddLine(pointFor(i));
+            sink->AddLine(D2D1::Point2F(plotRect.right, plotRect.bottom));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink->Close();
+        }
+
+        bool anyWarn = (warnThreshold > 0.0f) && (rangeMax > 0.0f) && (spark.maxVal() >= warnThreshold * rangeMax);
+        ID2D1SolidColorBrush* lineBrush = anyWarn ? g_overlayGraphWarnBrush.Get() : g_overlayGraphLineBrush.Get();
+
+        if (fillGeo) g_d2dContext->FillGeometry(fillGeo.Get(), g_overlayGraphFillBrush.Get());
+        if (lineGeo) g_d2dContext->DrawGeometry(lineGeo.Get(), lineBrush, 1.5f);
+    }
+
+    // Min / avg / max caption beneath the plot.
+    wchar_t capBuf[96];
+    swprintf_s(capBuf, L"min %.1f  avg %.1f  max %.1f%s",
+        spark.minVal(), spark.avgVal(), spark.maxVal(), unitSuffix);
+    D2D1_RECT_F capRect = D2D1::RectF(rect.left + 4.0f, rect.bottom - 13.0f, rect.right - 4.0f, rect.bottom - 1.0f);
+    g_d2dContext->DrawTextW(capBuf, static_cast<UINT32>(wcslen(capBuf)), g_overlayLabelFormat.Get(),
+        capRect, g_overlayTextBrush.Get());
+}
+
 // Draws the benchmark/diagnostics HUD directly onto the backbuffer using D2D,
 // after the D3D11 composite pass has finished writing it. This runs through
 // the D3D/D2D interop device context so it composites correctly on top of
 // the Matrix rain without needing its own render target.
+//
+// Layout: a header line of scalar stats, then a 2x2 (or 2x3, depending on
+// whether GPU-usage counters resolved) grid of sparkline graphs -- FPS,
+// frame time, CPU (process + system), and GPU (usage% + VRAM%) -- followed by
+// the GPU adapter/VRAM text line and the toggle hint.
 static void DrawBenchmarkOverlay(MonitorWindow& mw) {
     if (!g_benchEnabled || !g_d2dContext || !mw.overlayD2DTarget || !g_overlayTextFormat) return;
-
-    wchar_t buf[1024];
-    int len = swprintf_s(buf,
-        L"FPS: %.1f   frame: %.2f ms (min %.2f / avg %.2f / max %.2f / p99 %.2f)\n"
-        L"Frames rendered: %llu   Dropped presents: %llu\n"
-        L"CPU  -- this process: %.1f%%   system total: %.1f%% (%d logical cores)\n"
-        L"RAM  -- this process: %s working set / %s private   system: %.0f%% used (%s / %s)\n"
-        L"GPU adapter: %s%s\n"
-        L"GPU VRAM: %s used / %s budget%s\n"
-        L"[B] toggle this overlay",
-        g_currentFps, g_avgFrameMs, g_minFrameMs, g_avgFrameMs, g_maxFrameMs, g_p99FrameMs,
-        static_cast<unsigned long long>(g_totalFramesRendered),
-        static_cast<unsigned long long>(g_droppedPresentCount),
-        g_processCpuPercent, g_systemCpuPercent, g_logicalCoreCount,
-        FormatBytesMB(g_processWorkingSetBytes).c_str(), FormatBytesMB(g_processPrivateBytes).c_str(),
-        g_systemMemPercent, FormatBytesMB(g_systemUsedPhysBytes).c_str(), FormatBytesMB(g_systemTotalPhysBytes).c_str(),
-        g_chosenAdapter.description.c_str(), g_chosenAdapter.likelyDiscrete ? L" (discrete)" : L" (integrated)",
-        g_dxgiAdapter3 ? FormatBytesMB(g_gpuVideoMemUsedBytes).c_str() : L"n/a",
-        g_dxgiAdapter3 ? FormatBytesMB(g_gpuVideoMemBudgetBytes).c_str() : L"n/a",
-        g_dxgiAdapter3 ? L"" : L" (query unsupported on this driver)"
-    );
-    if (len < 0) return;
 
     g_d2dContext->SetTarget(mw.overlayD2DTarget.Get());
     g_d2dContext->BeginDraw();
 
     const float pad = 10.0f;
-    const float panelW = 620.0f;
-    const float panelH = 130.0f;
+    const float panelW = 640.0f;
+
+    // -- Header: scalar readout of the headline numbers ---------------------
+    wchar_t headerBuf[512];
+    int headerLen = swprintf_s(headerBuf,
+        L"FPS %.1f   frame %.2fms (p99 %.2fms)   frames %llu   dropped presents %llu\n"
+        L"RAM -- process: %s WS / %s private   system: %.0f%% used (%s / %s)",
+        g_currentFps, g_avgFrameMs, g_p99FrameMs,
+        static_cast<unsigned long long>(g_totalFramesRendered),
+        static_cast<unsigned long long>(g_droppedPresentCount),
+        FormatBytesMB(g_processWorkingSetBytes).c_str(), FormatBytesMB(g_processPrivateBytes).c_str(),
+        g_systemMemPercent, FormatBytesMB(g_systemUsedPhysBytes).c_str(), FormatBytesMB(g_systemTotalPhysBytes).c_str());
+    if (headerLen < 0) headerLen = 0;
+
+    const float headerH = 40.0f;
+    const float graphRowH = 62.0f;
+    const float graphGap = 6.0f;
+    const bool haveGpuUsage = g_gpuUsageAvailable;
+    const int graphCols = haveGpuUsage ? 3 : 2;
+    const int graphRows = haveGpuUsage ? 2 : 2;
+    const float graphsH = graphRowH * graphRows + graphGap * (graphRows - 1);
+    const float footerH = 34.0f; // GPU adapter line + toggle hint
+    const float panelH = pad + headerH + 6.0f + graphsH + 6.0f + footerH + pad;
+
     D2D1_RECT_F bgRect = D2D1::RectF(pad, pad, pad + panelW, pad + panelH);
     g_d2dContext->FillRectangle(bgRect, g_overlayBgBrush.Get());
 
-    D2D1_RECT_F textRect = D2D1::RectF(pad + 8.0f, pad + 6.0f, pad + panelW - 8.0f, pad + panelH - 6.0f);
-    g_d2dContext->DrawTextW(buf, static_cast<UINT32>(len), g_overlayTextFormat.Get(), textRect, g_overlayTextBrush.Get());
+    D2D1_RECT_F headerRect = D2D1::RectF(pad + 8.0f, pad + 6.0f, pad + panelW - 8.0f, pad + 6.0f + headerH);
+    g_d2dContext->DrawTextW(headerBuf, static_cast<UINT32>(headerLen), g_overlayTextFormat.Get(), headerRect, g_overlayTextBrush.Get());
 
-    // Note about GPU selection (only shown when relevant, drawn as a second line
-    // beneath the panel so it doesn't compete for space with the dense stats).
+    // -- Sparkline grid -------------------------------------------------------
+    float gridTop = pad + 6.0f + headerH + 6.0f;
+    float gridLeft = pad + 8.0f;
+    float gridRight = pad + panelW - 8.0f;
+    float cellW = (gridRight - gridLeft - graphGap * (graphCols - 1)) / graphCols;
+
+    auto cellRect = [&](int col, int row) -> D2D1_RECT_F {
+        float x = gridLeft + col * (cellW + graphGap);
+        float y = gridTop + row * (graphRowH + graphGap);
+        return D2D1::RectF(x, y, x + cellW, y + graphRowH);
+    };
+
+    // Row 0: FPS, frame time, (GPU usage if available)
+    DrawSparklineWidget(cellRect(0, 0), L"FPS", g_fpsSpark, L"", 0.0f, 0.0f);
+    DrawSparklineWidget(cellRect(1, 0), L"Frame time (ms)", g_frameMsSpark, L"", 0.0f, 0.75f);
+    if (haveGpuUsage) {
+        DrawSparklineWidget(cellRect(2, 0), L"GPU usage", g_gpuUsageSpark, L"%", 100.0f, 0.9f);
+    }
+
+    // Row 1: process CPU, system CPU, VRAM % of budget
+    DrawSparklineWidget(cellRect(0, 1), L"CPU (process)", g_processCpuSpark, L"%", 100.0f, 0.9f);
+    DrawSparklineWidget(cellRect(1, 1), L"CPU (system)", g_systemCpuSpark, L"%", 100.0f, 0.9f);
+    if (haveGpuUsage) {
+        DrawSparklineWidget(cellRect(2, 1), L"GPU VRAM used", g_gpuVramPctSpark, L"%", 100.0f, 0.9f);
+    }
+
+    // If GPU usage counters aren't available on this system, put the VRAM
+    // graph in the second column of row 0 instead of leaving a 3rd column gap.
+    if (!haveGpuUsage) {
+        DrawSparklineWidget(cellRect(1, 0), L"Frame time (ms)", g_frameMsSpark, L"", 0.0f, 0.75f);
+    }
+
+    // -- Footer: GPU adapter line + toggle hint -------------------------------
+    wchar_t footerBuf[512];
+    int footerLen = swprintf_s(footerBuf,
+        L"GPU: %s%s -- VRAM %s / %s%s\n"
+        L"[B] toggle overlay (benchmarking itself always runs in the background)",
+        g_chosenAdapter.description.c_str(), g_chosenAdapter.likelyDiscrete ? L" (discrete)" : L" (integrated)",
+        g_dxgiAdapter3 ? FormatBytesMB(g_gpuVideoMemUsedBytes).c_str() : L"n/a",
+        g_dxgiAdapter3 ? FormatBytesMB(g_gpuVideoMemBudgetBytes).c_str() : L"n/a",
+        g_dxgiAdapter3 ? L"" : L" (unsupported on this driver)");
+    if (footerLen < 0) footerLen = 0;
+
+    float footerTop = gridTop + graphsH + 6.0f;
+    D2D1_RECT_F footerRect = D2D1::RectF(pad + 8.0f, footerTop, pad + panelW - 8.0f, footerTop + footerH);
+    g_d2dContext->DrawTextW(footerBuf, static_cast<UINT32>(footerLen), g_overlayTextFormat.Get(), footerRect, g_overlayTextBrush.Get());
+
+    // Note about GPU selection (only shown when relevant), drawn below the panel
+    // so it doesn't compete for space with the dense stats above.
     if (!g_adapterSelectionNote.empty()) {
         D2D1_RECT_F noteRect = D2D1::RectF(pad, pad + panelH + 4.0f, pad + panelW, pad + panelH + 40.0f);
         g_d2dContext->DrawTextW(g_adapterSelectionNote.c_str(), static_cast<UINT32>(g_adapterSelectionNote.size()),
@@ -1378,8 +1707,12 @@ static void DrawFrame(MonitorWindow& mw, DWORD tickCount) {
     g_lastFrameQpc = frameStartQpc;
     ++g_totalFramesRendered;
 
+    // Stats collection (CPU/mem/GPU sampling + sparkline history) runs
+    // unconditionally, independent of g_benchEnabled, so the overlay is
+    // instantly populated with live history the moment 'B' reveals it rather
+    // than needing to "warm up" after being toggled on.
     ULONGLONG nowTick = GetTickCount64();
-    if (g_benchEnabled && (nowTick - g_lastStatsRefreshTick) >= STATS_REFRESH_INTERVAL_MS) {
+    if ((nowTick - g_lastStatsRefreshTick) >= STATS_REFRESH_INTERVAL_MS) {
         RefreshCpuAndMemoryStats();
         g_lastStatsRefreshTick = nowTick;
     }
@@ -1787,8 +2120,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_KEYDOWN:
-        // 'B' toggles the benchmark/diagnostics overlay without exiting the
+        // 'B' shows/hides the benchmark/diagnostics overlay without exiting the
         // screensaver, so you can check performance without losing the session.
+        // Benchmarking data collection itself is always running in the
+        // background (see ENABLE_BENCHMARK_OVERLAY comment above), so the panel
+        // appears instantly populated with history the first time 'B' is
+        // pressed, not just after it's been left open for a while.
         // Only meaningful when the overlay is compiled in; when
         // ENABLE_BENCHMARK_OVERLAY is 0, 'B' falls through and exits like any
         // other key, since there's nothing to toggle.
